@@ -6,8 +6,10 @@ use std::sync::atomic::Ordering;
 fn main() {
     #[cfg(target_arch = "x86")]
     unsafe {
-        let mxcsr = std::arch::x86::_mm_getcsr();
-        std::arch::x86::_mm_setcsr(mxcsr | 0x8040); // 0x8000 (FTZ) | 0x0040 (DAZ)
+        let mut mxcsr: u32 = 0;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack));
+        mxcsr |= 0x8040; // 0x8000 (FTZ) | 0x0040 (DAZ)
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -36,14 +38,23 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        eprintln!("[test] SUCCESS! Plugin initialized. num_params={}, num_inputs={}, num_outputs={}",
-            inst.num_params(), inst.num_inputs(), inst.num_outputs());
+        eprintln!(
+            "[test] SUCCESS! Plugin initialized. num_params={}, num_inputs={}, num_outputs={}",
+            inst.num_params(),
+            inst.num_inputs(),
+            inst.num_outputs()
+        );
         inst.open();
         inst.set_sample_rate(44100.0);
         inst.set_block_size(256);
         inst.resume();
         for i in 0..inst.num_params() {
-            eprintln!("[test] Param {} ('{}') = {}", i, inst.get_parameter_name(i), inst.get_parameter(i));
+            eprintln!(
+                "[test] Param {} ('{}') = {}",
+                i,
+                inst.get_parameter_name(i),
+                inst.get_parameter(i)
+            );
         }
         inst.set_parameter(0, 1.0);
         inst.set_parameter(1, 0.5);
@@ -98,23 +109,37 @@ fn main() {
         if let Some(ref inst_r) = inst2 {
             inst.process_audio(&[&in_buf_l], &mut [&mut out_l], 256);
             inst_r.process_audio(&[&in_buf_r], &mut [&mut out_r], 256);
-            eprintln!("[test] Dual-DSP success! L non-zeros={}/256, R non-zeros={}/256",
+            eprintln!(
+                "[test] Dual-DSP success! L non-zeros={}/256, R non-zeros={}/256",
                 out_l.iter().filter(|&&x| x.abs() > 1e-6).count(),
-                out_r.iter().filter(|&&x| x.abs() > 1e-6).count());
-            eprintln!("[test] L first 4={:?}, R first 4={:?}", &out_l[..4], &out_r[..4]);
+                out_r.iter().filter(|&&x| x.abs() > 1e-6).count()
+            );
+            eprintln!(
+                "[test] L first 4={:?}, R first 4={:?}",
+                &out_l[..4],
+                &out_r[..4]
+            );
         } else {
             inst.process_audio(&[&in_buf_l, &in_buf_r], &mut [&mut out_l, &mut out_r], 256);
-            eprintln!("[test] Native stereo process success! L non-zeros={}/256, R non-zeros={}/256",
+            eprintln!(
+                "[test] Native stereo process success! L non-zeros={}/256, R non-zeros={}/256",
                 out_l.iter().filter(|&&x| x.abs() > 1e-6).count(),
-                out_r.iter().filter(|&&x| x.abs() > 1e-6).count());
-            eprintln!("[test] L first 4={:?}, R first 4={:?}", &out_l[..4], &out_r[..4]);
+                out_r.iter().filter(|&&x| x.abs() > 1e-6).count()
+            );
+            eprintln!(
+                "[test] L first 4={:?}, R first 4={:?}",
+                &out_l[..4],
+                &out_r[..4]
+            );
         }
         let non_zeros = out_l.iter().filter(|&&x| x.abs() > 1e-6).count();
-        eprintln!("[test] Processed 256 samples: non_zeros={}/256, min={:?}, max={:?}, first 4={:?}",
+        eprintln!(
+            "[test] Processed 256 samples: non_zeros={}/256, min={:?}, max={:?}, first 4={:?}",
             non_zeros,
             out_l.iter().cloned().fold(f32::INFINITY, f32::min),
             out_l.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-            &out_l[..4]);
+            &out_l[..4]
+        );
         return;
     }
 
@@ -149,7 +174,9 @@ fn main() {
     }
 
     // Signal ready for commands
-    bridge.status.store(protocol::STATUS_READY, Ordering::Release);
+    bridge
+        .status
+        .store(protocol::STATUS_READY, Ordering::Release);
     unsafe {
         protocol::futex_wake(&bridge.status);
     }
@@ -169,7 +196,8 @@ fn main() {
         if host_seq == worker_seq {
             // Idle wait: sleep on futex until host_seq changes
             unsafe {
-                protocol::futex_wait(&bridge.host_seq, host_seq, Some(100_000)); // 100ms timeout
+                protocol::futex_wait(&bridge.host_seq, host_seq, Some(100_000));
+                // 100ms timeout
             }
             continue;
         }
@@ -212,13 +240,15 @@ fn main() {
                             bridge.num_outputs = inst_l.num_outputs() as u32;
 
                             for i in 0..inst_l.num_params() {
-                                let mut meta = protocol::ParamMeta::default();
-                                meta.id = i as u32;
                                 let name = inst_l.get_parameter_name(i);
                                 let name_bytes = name.as_bytes();
                                 let copy_len = name_bytes.len().min(31);
+                                let mut meta = protocol::ParamMeta {
+                                    id: i as u32,
+                                    default_val: inst_l.get_parameter(i),
+                                    ..Default::default()
+                                };
                                 meta.name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-                                meta.default_val = inst_l.get_parameter(i);
                                 if (i as usize) < protocol::MAX_PARAMS {
                                     bridge.params[i as usize] = meta;
                                 }
@@ -233,12 +263,16 @@ fn main() {
                         }
                         Err(e) => {
                             eprintln!("[zfx-worker32] init_zfx_plugin error: {}", e);
-                            bridge.status.store(protocol::STATUS_ERROR, Ordering::Release);
+                            bridge
+                                .status
+                                .store(protocol::STATUS_ERROR, Ordering::Release);
                         }
                     },
                     Err(e) => {
                         eprintln!("[zfx-worker32] PeModule::load error: {}", e);
-                        bridge.status.store(protocol::STATUS_ERROR, Ordering::Release);
+                        bridge
+                            .status
+                            .store(protocol::STATUS_ERROR, Ordering::Release);
                     }
                 }
                 bridge.worker_seq.store(host_seq, Ordering::Release);
@@ -272,8 +306,10 @@ fn main() {
                         unsafe {
                             peldr::CURRENT_TIME_INFO.tempo = bridge.tempo;
                             peldr::CURRENT_TIME_INFO.ppq_pos = bridge.beat_pos;
-                            peldr::CURRENT_TIME_INFO.time_sig_numerator = bridge.time_sig_num as i32;
-                            peldr::CURRENT_TIME_INFO.time_sig_denominator = bridge.time_sig_denom as i32;
+                            peldr::CURRENT_TIME_INFO.time_sig_numerator =
+                                bridge.time_sig_num as i32;
+                            peldr::CURRENT_TIME_INFO.time_sig_denominator =
+                                bridge.time_sig_denom as i32;
                             if bridge.is_playing != 0 {
                                 peldr::CURRENT_TIME_INFO.flags |= 0x0002;
                             } else {
@@ -283,7 +319,9 @@ fn main() {
                     }
 
                     // 1. Process queued parameter updates
-                    let num_chgs = bridge.num_param_changes.min(protocol::MAX_PARAM_QUEUE as u32);
+                    let num_chgs = bridge
+                        .num_param_changes
+                        .min(protocol::MAX_PARAM_QUEUE as u32);
                     for i in 0..num_chgs as usize {
                         let chg = bridge.param_queue[i];
                         dsp.inst_l.set_parameter(chg.id as i32, chg.value);
@@ -309,15 +347,22 @@ fn main() {
                             // Dual-mono True Stereo processing:
                             // Channel 0 (Left) -> inst_l -> Channel 0 (Left)
                             // Channel 1 (Right) -> inst_r -> Channel 1 (Right)
-                            dsp.inst_l.process_audio(&[in_l_slice], &mut [out_l_slice], frames);
+                            dsp.inst_l
+                                .process_audio(&[in_l_slice], &mut [out_l_slice], frames);
                             r.process_audio(&[in_r_slice], &mut [out_r_slice], frames);
                         } else {
-                            dsp.inst_l.process_audio(&[in_l_slice, in_r_slice], &mut [out_l_slice, out_r_slice], frames);
+                            dsp.inst_l.process_audio(
+                                &[in_l_slice, in_r_slice],
+                                &mut [out_l_slice, out_r_slice],
+                                frames,
+                            );
                         }
                     }
                     bridge.status.store(protocol::STATUS_OK, Ordering::Release);
                 } else {
-                    bridge.status.store(protocol::STATUS_ERROR, Ordering::Release);
+                    bridge
+                        .status
+                        .store(protocol::STATUS_ERROR, Ordering::Release);
                 }
                 bridge.worker_seq.store(host_seq, Ordering::Release);
                 unsafe {

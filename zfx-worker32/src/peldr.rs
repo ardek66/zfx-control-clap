@@ -1,9 +1,9 @@
+use goblin::pe::PE;
+use once_cell::sync::Lazy;
 use std::ffi::{c_void, CStr};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
-use goblin::pe::PE;
-use once_cell::sync::Lazy;
 
 /// Represents our embedded, memory-mapped Windows DLL.
 pub struct PeModule {
@@ -49,7 +49,11 @@ impl PeModule {
         // 2. Copy PE headers
         let size_of_headers = opt_hdr.windows_fields.size_of_headers as usize;
         unsafe {
-            ptr::copy_nonoverlapping(raw_dll_bytes.as_ptr(), base_ptr, size_of_headers.min(raw_dll_bytes.len()));
+            ptr::copy_nonoverlapping(
+                raw_dll_bytes.as_ptr(),
+                base_ptr,
+                size_of_headers.min(raw_dll_bytes.len()),
+            );
         }
 
         // 3. Copy PE sections to their virtual addresses
@@ -58,7 +62,9 @@ impl PeModule {
                 let raw_start = section.pointer_to_raw_data as usize;
                 let raw_size = section.size_of_raw_data as usize;
                 let virt_start = section.virtual_address as usize;
-                if raw_start + raw_size <= raw_dll_bytes.len() && virt_start + raw_size <= size_of_image {
+                if raw_start + raw_size <= raw_dll_bytes.len()
+                    && virt_start + raw_size <= size_of_image
+                {
                     unsafe {
                         ptr::copy_nonoverlapping(
                             raw_dll_bytes.as_ptr().add(raw_start),
@@ -72,7 +78,10 @@ impl PeModule {
 
         // 4. Apply Base Relocations if the image was not loaded at image_base
         let delta = (base_ptr as usize as isize).wrapping_sub(image_base as isize);
-        eprintln!("[peldr] base_ptr={:?}, image_base={:#x}, delta={:#x}", base_ptr, image_base, delta);
+        eprintln!(
+            "[peldr] base_ptr={:?}, image_base={:#x}, delta={:#x}",
+            base_ptr, image_base, delta
+        );
         if delta != 0 {
             unsafe {
                 Self::apply_relocations(base_ptr, raw_dll_bytes, delta)?;
@@ -99,19 +108,28 @@ impl PeModule {
             eprintln!("[peldr] Hardware dongle check bypassed at RVA {:#x}", pos);
         }
 
-        Ok(Self { base_addr, size: size_of_image })
+        Ok(Self {
+            base_addr,
+            size: size_of_image,
+        })
     }
 
     /// Applies base relocations from the .reloc directory
-    unsafe fn apply_relocations(base_ptr: *mut u8, raw_dll: &[u8], delta: isize) -> Result<(), &'static str> {
+    unsafe fn apply_relocations(
+        base_ptr: *mut u8,
+        raw_dll: &[u8],
+        delta: isize,
+    ) -> Result<(), &'static str> {
         let pe_off = u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap()) as usize;
         let opt_off = pe_off + 24;
         // DataDirectory[5] is Base Relocation Table (offset 136 in optional header)
         if opt_off + 144 > raw_dll.len() {
             return Ok(());
         }
-        let reloc_rva = u32::from_le_bytes(raw_dll[opt_off + 136..opt_off + 140].try_into().unwrap()) as usize;
-        let reloc_size = u32::from_le_bytes(raw_dll[opt_off + 140..opt_off + 144].try_into().unwrap()) as usize;
+        let reloc_rva =
+            u32::from_le_bytes(raw_dll[opt_off + 136..opt_off + 140].try_into().unwrap()) as usize;
+        let reloc_size =
+            u32::from_le_bytes(raw_dll[opt_off + 140..opt_off + 144].try_into().unwrap()) as usize;
 
         if reloc_rva == 0 || reloc_size == 0 {
             return Ok(());
@@ -155,8 +173,10 @@ impl PeModule {
         if opt_off + 112 > raw_dll.len() {
             return Ok(());
         }
-        let imp_rva = u32::from_le_bytes(raw_dll[opt_off + 104..opt_off + 108].try_into().unwrap()) as usize;
-        let imp_size = u32::from_le_bytes(raw_dll[opt_off + 108..opt_off + 112].try_into().unwrap()) as usize;
+        let imp_rva =
+            u32::from_le_bytes(raw_dll[opt_off + 104..opt_off + 108].try_into().unwrap()) as usize;
+        let imp_size =
+            u32::from_le_bytes(raw_dll[opt_off + 108..opt_off + 112].try_into().unwrap()) as usize;
 
         if imp_rva == 0 || imp_size == 0 {
             return Ok(());
@@ -182,7 +202,8 @@ impl PeModule {
 
             let mut slot_idx = 0;
             loop {
-                let thunk_entry = ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4) as *const u32);
+                let thunk_entry =
+                    ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4) as *const u32);
                 if thunk_entry == 0 {
                     break;
                 }
@@ -192,11 +213,14 @@ impl PeModule {
                 if (thunk_entry & 0x80000000) == 0 {
                     // Import by name
                     let name_entry_ptr = base_ptr.add(thunk_entry as usize);
-                    let func_name = CStr::from_ptr(name_entry_ptr.add(2) as *const i8)
-                        .to_string_lossy();
+                    let func_name =
+                        CStr::from_ptr(name_entry_ptr.add(2) as *const i8).to_string_lossy();
 
                     let hook_ptr = resolve_import_symbol(&dll_name_str, &func_name);
-                    eprintln!("[peldr import] {}!{} -> {:?}", dll_name_str, func_name, hook_ptr);
+                    eprintln!(
+                        "[peldr import] {}!{} -> {:?}",
+                        dll_name_str, func_name, hook_ptr
+                    );
                     *target_iat = hook_ptr;
                 }
 
@@ -228,12 +252,16 @@ impl PeModule {
             let ords_rva = ptr::read_unaligned(exp_ptr.add(36) as *const u32) as usize;
 
             for i in 0..num_names {
-                let n_rva = ptr::read_unaligned(base_ptr.add(names_rva + i * 4) as *const u32) as usize;
+                let n_rva =
+                    ptr::read_unaligned(base_ptr.add(names_rva + i * 4) as *const u32) as usize;
                 let sym_name = CStr::from_ptr(base_ptr.add(n_rva) as *const i8).to_string_lossy();
                 if sym_name == name {
-                    let ord = ptr::read_unaligned(base_ptr.add(ords_rva + i * 2) as *const u16) as usize;
+                    let ord =
+                        ptr::read_unaligned(base_ptr.add(ords_rva + i * 2) as *const u16) as usize;
                     if ord < num_functions {
-                        let fn_rva = ptr::read_unaligned(base_ptr.add(funcs_rva + ord * 4) as *const u32) as usize;
+                        let fn_rva =
+                            ptr::read_unaligned(base_ptr.add(funcs_rva + ord * 4) as *const u32)
+                                as usize;
                         return Some(base_ptr.add(fn_rva) as *mut c_void);
                     }
                 }
@@ -243,16 +271,19 @@ impl PeModule {
     }
 
     /// Resolves the ZTypeIF export
+    #[allow(dead_code)]
     pub fn get_ztypeif(&self) -> Result<extern "C" fn(), &'static str> {
-        let export_fn = self.get_export("ZTypeIF")
+        let export_fn = self
+            .get_export("ZTypeIF")
             .or_else(|| self.get_export("getinterface"))
             .ok_or("Failed to locate ZTypeIF export")?;
-        Ok(unsafe { std::mem::transmute(export_fn) })
+        Ok(unsafe { std::mem::transmute::<*mut c_void, extern "C" fn()>(export_fn) })
     }
 
     /// Resolves ZTypeIF or getinterface and initializes the DSP instance with host callback
     pub fn init_zfx_plugin(&self) -> Result<ZfxDspInstance, &'static str> {
-        let export_fn = self.get_export("ZTypeIF")
+        let export_fn = self
+            .get_export("ZTypeIF")
             .or_else(|| self.get_export("getinterface"))
             .ok_or("Failed to locate ZTypeIF or getinterface export in PE")?;
 
@@ -264,12 +295,18 @@ impl PeModule {
         let getinterface: extern "C" fn(host_callback: *const c_void) -> *mut c_void =
             unsafe { std::mem::transmute(export_fn) };
 
-        eprintln!("[peldr] Calling getinterface({:?})...", default_audio_master as *const c_void);
+        eprintln!(
+            "[peldr] Calling getinterface({:?})...",
+            default_audio_master as *const c_void
+        );
         let instance = unsafe {
             let _guard = Win32ContextGuard::enter();
             getinterface(default_audio_master as *const c_void)
         };
-        eprintln!("[peldr] Returned from getinterface: instance={:?}", instance);
+        eprintln!(
+            "[peldr] Returned from getinterface: instance={:?}",
+            instance
+        );
         if instance.is_null() {
             return Err("getinterface returned null pointer");
         }
@@ -308,15 +345,8 @@ pub struct AEffect {
         outputs: *mut *mut f32,
         sampleframes: i32,
     ),
-    pub set_parameter: unsafe extern "C" fn(
-        effect: *mut AEffect,
-        index: i32,
-        parameter: f32,
-    ),
-    pub get_parameter: unsafe extern "C" fn(
-        effect: *mut AEffect,
-        index: i32,
-    ) -> f32,
+    pub set_parameter: unsafe extern "C" fn(effect: *mut AEffect, index: i32, parameter: f32),
+    pub get_parameter: unsafe extern "C" fn(effect: *mut AEffect, index: i32) -> f32,
     pub num_programs: i32,
     pub num_params: i32,
     pub num_inputs: i32,
@@ -343,6 +373,7 @@ pub struct AEffect {
 
 #[derive(Clone, Copy)]
 pub struct ZfxDspInstance {
+    #[allow(dead_code)]
     pub iface_wrapper: *mut c_void,
     pub effect: *mut AEffect,
 }
@@ -384,7 +415,14 @@ impl ZfxDspInstance {
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 8 = effGetParamName
-            ((*self.effect).dispatcher)(self.effect, 8, index, 0, buf.as_mut_ptr() as *mut c_void, 0.0);
+            ((*self.effect).dispatcher)(
+                self.effect,
+                8,
+                index,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                0.0,
+            );
         }
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         String::from_utf8_lossy(&buf[..len]).trim().to_string()
@@ -404,10 +442,15 @@ impl ZfxDspInstance {
         }
     }
 
-    pub fn process_replacing_f64(&self, inputs: *const *const f64, outputs: *mut *mut f64, sample_frames: i32) {
+    pub fn process_replacing_f64(
+        &self,
+        inputs: *const *const f64,
+        outputs: *mut *mut f64,
+        sample_frames: i32,
+    ) {
         unsafe {
             let obj = (*self.effect).object as *mut *mut usize;
-            let vtable = *obj as *mut usize;
+            let vtable = *obj;
             let dsp_proc_fn = *vtable.add(9);
             let _guard = Win32ContextGuard::enter();
             std::arch::asm!(
@@ -435,16 +478,18 @@ impl ZfxDspInstance {
         let dsp_outs = unsafe { (*self.effect).num_outputs.max(2) as usize };
 
         // Prepare 64-bit input buffers
-        let in_f64: Vec<Vec<f64>> = (0..dsp_ins).map(|ch| {
-            if inputs.is_empty() {
-                vec![0.0f64; frames]
-            } else if ch < inputs.len() {
-                inputs[ch].iter().map(|&s| s as f64).collect()
-            } else {
-                // If DSP requires channel 1 but host only provided channel 0, duplicate channel 0
-                inputs[0].iter().map(|&s| s as f64).collect()
-            }
-        }).collect();
+        let in_f64: Vec<Vec<f64>> = (0..dsp_ins)
+            .map(|ch| {
+                if inputs.is_empty() {
+                    vec![0.0f64; frames]
+                } else if ch < inputs.len() {
+                    inputs[ch].iter().map(|&s| s as f64).collect()
+                } else {
+                    // If DSP requires channel 1 but host only provided channel 0, duplicate channel 0
+                    inputs[0].iter().map(|&s| s as f64).collect()
+                }
+            })
+            .collect();
 
         let mut out_f64: Vec<Vec<f64>> = (0..dsp_outs).map(|_| vec![0.0f64; frames]).collect();
 
@@ -468,7 +513,13 @@ impl ZfxDspInstance {
         }
     }
 
-    pub fn process_replacing(&self, inputs: *const *const f32, outputs: *mut *mut f32, sample_frames: i32) {
+    #[allow(dead_code)]
+    pub fn process_replacing(
+        &self,
+        inputs: *const *const f32,
+        outputs: *mut *mut f32,
+        sample_frames: i32,
+    ) {
         unsafe {
             let _guard = Win32ContextGuard::enter();
             ((*self.effect).process_replacing)(self.effect, inputs, outputs, sample_frames);
@@ -489,7 +540,14 @@ impl ZfxDspInstance {
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 11 = effSetBlockSize in VST 2.4
-            ((*self.effect).dispatcher)(self.effect, 11, 0, block_size as isize, ptr::null_mut(), 0.0);
+            ((*self.effect).dispatcher)(
+                self.effect,
+                11,
+                0,
+                block_size as isize,
+                ptr::null_mut(),
+                0.0,
+            );
         }
     }
 
@@ -568,7 +626,10 @@ pub unsafe extern "C" fn default_audio_master(
     _ptr: *mut c_void,
     opt: f32,
 ) -> isize {
-    eprintln!("[default_audio_master] opcode={}, index={}, value={}, opt={}", opcode, index, value, opt);
+    eprintln!(
+        "[default_audio_master] opcode={}, index={}, value={}, opt={}",
+        opcode, index, value, opt
+    );
     match opcode {
         1 => 2400, // audioMasterVersion (VST 2.4)
         7 => {
@@ -588,13 +649,23 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
     match (dll, func) {
         // SETUPAPI.dll (Hardware Dongle Protection Spoofing)
         ("setupapi.dll", "SetupDiGetClassDevsA") => hook_SetupDiGetClassDevsA as *mut c_void,
-        ("setupapi.dll", "SetupDiEnumDeviceInterfaces") => hook_SetupDiEnumDeviceInterfaces as *mut c_void,
-        ("setupapi.dll", "SetupDiGetDeviceInterfaceDetailA") => hook_SetupDiGetDeviceInterfaceDetailA as *mut c_void,
-        ("setupapi.dll", "SetupDiGetDeviceRegistryPropertyA") => hook_SetupDiGetDeviceRegistryPropertyA as *mut c_void,
-        ("setupapi.dll", "SetupDiDestroyDeviceInfoList") => hook_SetupDiDestroyDeviceInfoList as *mut c_void,
+        ("setupapi.dll", "SetupDiEnumDeviceInterfaces") => {
+            hook_SetupDiEnumDeviceInterfaces as *mut c_void
+        }
+        ("setupapi.dll", "SetupDiGetDeviceInterfaceDetailA") => {
+            hook_SetupDiGetDeviceInterfaceDetailA as *mut c_void
+        }
+        ("setupapi.dll", "SetupDiGetDeviceRegistryPropertyA") => {
+            hook_SetupDiGetDeviceRegistryPropertyA as *mut c_void
+        }
+        ("setupapi.dll", "SetupDiDestroyDeviceInfoList") => {
+            hook_SetupDiDestroyDeviceInfoList as *mut c_void
+        }
 
         // KERNEL32.dll
-        ("kernel32.dll", "InitializeCriticalSection") => hook_InitializeCriticalSection as *mut c_void,
+        ("kernel32.dll", "InitializeCriticalSection") => {
+            hook_InitializeCriticalSection as *mut c_void
+        }
         ("kernel32.dll", "DeleteCriticalSection") => hook_DeleteCriticalSection as *mut c_void,
         ("kernel32.dll", "EnterCriticalSection") => hook_EnterCriticalSection as *mut c_void,
         ("kernel32.dll", "LeaveCriticalSection") => hook_LeaveCriticalSection as *mut c_void,
@@ -605,21 +676,27 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
         ("kernel32.dll", "GetTickCount") => hook_GetTickCount as *mut c_void,
         ("kernel32.dll", "GetSystemTimeAsFileTime") => hook_GetSystemTimeAsFileTime as *mut c_void,
         ("kernel32.dll", "QueryPerformanceCounter") => hook_QueryPerformanceCounter as *mut c_void,
-        ("kernel32.dll", "InterlockedCompareExchange") => hook_InterlockedCompareExchange as *mut c_void,
+        ("kernel32.dll", "InterlockedCompareExchange") => {
+            hook_InterlockedCompareExchange as *mut c_void
+        }
         ("kernel32.dll", "InterlockedExchange") => hook_InterlockedExchange as *mut c_void,
         ("kernel32.dll", "IsDebuggerPresent") => hook_IsDebuggerPresent as *mut c_void,
         ("kernel32.dll", "Sleep") => hook_Sleep as *mut c_void,
-        ("kernel32.dll", "SetUnhandledExceptionFilter") => hook_SetUnhandledExceptionFilter as *mut c_void,
-        ("kernel32.dll", "UnhandledExceptionFilter") => hook_UnhandledExceptionFilter as *mut c_void,
+        ("kernel32.dll", "SetUnhandledExceptionFilter") => {
+            hook_SetUnhandledExceptionFilter as *mut c_void
+        }
+        ("kernel32.dll", "UnhandledExceptionFilter") => {
+            hook_UnhandledExceptionFilter as *mut c_void
+        }
         ("kernel32.dll", "TerminateProcess") => hook_TerminateProcess as *mut c_void,
 
         // MSVCR80.dll (Memory, String, and Math)
-        ("msvcr80.dll", "_malloc_crt") | ("msvcr80.dll", "??2@YAPAXI@Z") | ("msvcr80.dll", "??_U@YAPAXI@Z") => {
-            hook_malloc as *mut c_void
-        }
-        ("msvcr80.dll", "free") | ("msvcr80.dll", "??3@YAXPAX@Z") | ("msvcr80.dll", "??_V@YAXPAX@Z") => {
-            hook_free as *mut c_void
-        }
+        ("msvcr80.dll", "_malloc_crt")
+        | ("msvcr80.dll", "??2@YAPAXI@Z")
+        | ("msvcr80.dll", "??_U@YAPAXI@Z") => hook_malloc as *mut c_void,
+        ("msvcr80.dll", "free")
+        | ("msvcr80.dll", "??3@YAXPAX@Z")
+        | ("msvcr80.dll", "??_V@YAXPAX@Z") => hook_free as *mut c_void,
         ("msvcr80.dll", "memcpy") => libc::memcpy as *mut c_void,
         ("msvcr80.dll", "memset") => libc::memset as *mut c_void,
         ("msvcr80.dll", "strncpy") => libc::strncpy as *mut c_void,
@@ -641,19 +718,27 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
         ("msvcr80.dll", "__libm_sse2_tan") => hook_tan as *mut c_void,
 
         // CRT internals
-        ("msvcr80.dll", "_initterm") | ("msvcr80.dll", "_initterm_e") => hook_initterm as *mut c_void,
-        ("msvcr80.dll", "_encode_pointer") | ("msvcr80.dll", "_decode_pointer") => hook_identity as *mut c_void,
+        ("msvcr80.dll", "_initterm") | ("msvcr80.dll", "_initterm_e") => {
+            hook_initterm as *mut c_void
+        }
+        ("msvcr80.dll", "_encode_pointer") | ("msvcr80.dll", "_decode_pointer") => {
+            hook_identity as *mut c_void
+        }
         ("msvcr80.dll", "_encoded_null") => hook_null as *mut c_void,
-        ("msvcr80.dll", "_lock") | ("msvcr80.dll", "_unlock") | ("msvcr80.dll", "_amsg_exit") => hook_noop as *mut c_void,
+        ("msvcr80.dll", "_lock") | ("msvcr80.dll", "_unlock") | ("msvcr80.dll", "_amsg_exit") => {
+            hook_noop as *mut c_void
+        }
         ("msvcr80.dll", "_crt_debugger_hook") => hook_noop as *mut c_void,
         ("msvcr80.dll", "_onexit") => hook_onexit as *mut c_void,
         ("msvcr80.dll", "__dllonexit") => hook_dllonexit as *mut c_void,
         ("msvcr80.dll", "_purecall") => hook_purecall as *mut c_void,
         ("msvcr80.dll", "?terminate@@YAXXZ") => hook_noop as *mut c_void,
-        ("msvcr80.dll", "__CppXcptFilter") | ("msvcr80.dll", "_except_handler4_common") | ("msvcr80.dll", "__CxxFrameHandler3") => {
-            hook_zero as *mut c_void
+        ("msvcr80.dll", "__CppXcptFilter")
+        | ("msvcr80.dll", "_except_handler4_common")
+        | ("msvcr80.dll", "__CxxFrameHandler3") => hook_zero as *mut c_void,
+        ("msvcr80.dll", "?_type_info_dtor_internal_method@type_info@@QAEXXZ") => {
+            hook_noop as *mut c_void
         }
-        ("msvcr80.dll", "?_type_info_dtor_internal_method@type_info@@QAEXXZ") => hook_noop as *mut c_void,
         ("msvcr80.dll", "__clean_type_info_names_internal") => hook_noop as *mut c_void,
         ("msvcr80.dll", "__RTDynamicCast") => hook_identity as *mut c_void,
         ("msvcr80.dll", "_adjust_fdiv") => &raw mut ADJUST_FDIV as *mut c_void,
@@ -685,7 +770,7 @@ pub fn init_win32_teb() {
 
         WIN32_TEB[0] = 0xFFFFFFFF; // Head of SEH chain
         WIN32_TEB[6] = &raw const WIN32_TEB as u32; // Self pointer at TEB+0x18
-        WIN32_TEB[8] = libc::getpid() as u32;     // Process ID at TEB+0x20
+        WIN32_TEB[8] = libc::getpid() as u32; // Process ID at TEB+0x20
         WIN32_TEB[9] = libc::pthread_self() as u32; // Thread ID at TEB+0x24
 
         let mut desc = UserDesc {
@@ -700,7 +785,10 @@ pub fn init_win32_teb() {
         if res == 0 {
             let sel = ((desc.entry_number << 3) | 3) as u16;
             TEB_SELECTOR = sel;
-            eprintln!("[peldr] Win32 TEB initialized successfully! Selector={:#x}", sel);
+            eprintln!(
+                "[peldr] Win32 TEB initialized successfully! Selector={:#x}",
+                sel
+            );
         } else {
             eprintln!("[peldr] Warning: SYS_set_thread_area returned {}", res);
         }
@@ -771,7 +859,10 @@ pub unsafe extern "stdcall" fn hook_SetupDiEnumDeviceInterfaces(
     member_index: u32,
     device_interface_data: *mut c_void,
 ) -> i32 {
-    eprintln!("[hook_SetupDiEnumDeviceInterfaces] member_index={}", member_index);
+    eprintln!(
+        "[hook_SetupDiEnumDeviceInterfaces] member_index={}",
+        member_index
+    );
     if member_index == 0 {
         if !device_interface_data.is_null() {
             // SP_DEVICE_INTERFACE_DATA: cbSize is at offset 0, Flags is at offset 20
@@ -794,7 +885,8 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
     required_size: *mut u32,
     _device_info_data: *mut c_void,
 ) -> i32 {
-    const SPOOFED_PATH: &[u8] = b"\\\\?\\usb#vid_1686&pid_0047#c51t#{a5dcbf10-11d2-6530-c000-1f90ed51b94f}\0";
+    const SPOOFED_PATH: &[u8] =
+        b"\\\\?\\usb#vid_1686&pid_0047#c51t#{a5dcbf10-11d2-6530-c000-1f90ed51b94f}\0";
     let needed = (4 + SPOOFED_PATH.len()) as u32;
 
     if !required_size.is_null() {
@@ -808,7 +900,10 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
         ptr::copy_nonoverlapping(SPOOFED_PATH.as_ptr(), p.add(4), SPOOFED_PATH.len());
     }
 
-    eprintln!("[hook_SetupDiGetDeviceInterfaceDetailA] size={}, needed={}", device_interface_detail_data_size, needed);
+    eprintln!(
+        "[hook_SetupDiGetDeviceInterfaceDetailA] size={}, needed={}",
+        device_interface_detail_data_size, needed
+    );
     1 // TRUE
 }
 
@@ -823,7 +918,10 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceRegistryPropertyA(
     required_size: *mut u32,
 ) -> i32 {
     const HARDWARE_ID: &[u8] = b"USB\\VID_1686&PID_0047\0\0";
-    eprintln!("[hook_SetupDiGetDeviceRegistryPropertyA] prop={}, buf_size={}", property, property_buffer_size);
+    eprintln!(
+        "[hook_SetupDiGetDeviceRegistryPropertyA] prop={}, buf_size={}",
+        property, property_buffer_size
+    );
     if !required_size.is_null() {
         *required_size = HARDWARE_ID.len() as u32;
     }
@@ -837,7 +935,9 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceRegistryPropertyA(
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(_device_info_set: *mut c_void) -> i32 {
+pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(
+    _device_info_set: *mut c_void,
+) -> i32 {
     eprintln!("[hook_SetupDiDestroyDeviceInfoList]");
     1
 }
@@ -901,12 +1001,18 @@ pub unsafe extern "stdcall" fn hook_QueryPerformanceCounter(pc: *mut i64) -> i32
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_InterlockedCompareExchange(dest: *mut i32, exchange: i32, comparand: i32) -> i32 {
+pub unsafe extern "stdcall" fn hook_InterlockedCompareExchange(
+    dest: *mut i32,
+    exchange: i32,
+    comparand: i32,
+) -> i32 {
     if dest.is_null() {
         return 0;
     }
     let atomic = &*(dest as *const AtomicI32);
-    atomic.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst).unwrap_or_else(|v| v)
+    atomic
+        .compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
+        .unwrap_or_else(|v| v)
 }
 
 #[no_mangle]
@@ -985,14 +1091,30 @@ pub unsafe extern "C" fn hook_cifmod() {
     );
 }
 
-extern "C" fn math_atan(x: f64) -> f64 { x.atan() }
-extern "C" fn math_cos(x: f64) -> f64 { x.cos() }
-extern "C" fn math_sin(x: f64) -> f64 { x.sin() }
-extern "C" fn math_exp(x: f64) -> f64 { x.exp() }
-extern "C" fn math_log(x: f64) -> f64 { x.ln() }
-extern "C" fn math_log10(x: f64) -> f64 { x.log10() }
-extern "C" fn math_pow(x: f64, y: f64) -> f64 { x.powf(y) }
-extern "C" fn math_tan(x: f64) -> f64 { x.tan() }
+extern "C" fn math_atan(x: f64) -> f64 {
+    x.atan()
+}
+extern "C" fn math_cos(x: f64) -> f64 {
+    x.cos()
+}
+extern "C" fn math_sin(x: f64) -> f64 {
+    x.sin()
+}
+extern "C" fn math_exp(x: f64) -> f64 {
+    x.exp()
+}
+extern "C" fn math_log(x: f64) -> f64 {
+    x.ln()
+}
+extern "C" fn math_log10(x: f64) -> f64 {
+    x.log10()
+}
+extern "C" fn math_pow(x: f64, y: f64) -> f64 {
+    x.powf(y)
+}
+extern "C" fn math_tan(x: f64) -> f64 {
+    x.tan()
+}
 
 #[unsafe(naked)]
 #[no_mangle]
@@ -1196,7 +1318,10 @@ pub unsafe extern "C" fn hook_tan() {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_initterm(start: *const extern "C" fn(), end: *const extern "C" fn()) -> i32 {
+pub unsafe extern "C" fn hook_initterm(
+    start: *const extern "C" fn(),
+    end: *const extern "C" fn(),
+) -> i32 {
     let mut cur = start;
     while cur < end {
         let f = *cur;
@@ -1209,22 +1334,36 @@ pub unsafe extern "C" fn hook_initterm(start: *const extern "C" fn(), end: *cons
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_identity(p: *mut c_void) -> *mut c_void { p }
+pub unsafe extern "C" fn hook_identity(p: *mut c_void) -> *mut c_void {
+    p
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_null() -> *mut c_void { ptr::null_mut() }
+pub unsafe extern "C" fn hook_null() -> *mut c_void {
+    ptr::null_mut()
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn hook_noop() {}
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_zero() -> i32 { 0 }
+pub unsafe extern "C" fn hook_zero() -> i32 {
+    0
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_onexit(p: *mut c_void) -> *mut c_void { p }
+pub unsafe extern "C" fn hook_onexit(p: *mut c_void) -> *mut c_void {
+    p
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_dllonexit(p: *mut c_void, _a: *mut c_void, _b: *mut c_void) -> *mut c_void { p }
+pub unsafe extern "C" fn hook_dllonexit(
+    p: *mut c_void,
+    _a: *mut c_void,
+    _b: *mut c_void,
+) -> *mut c_void {
+    p
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn hook_purecall() {

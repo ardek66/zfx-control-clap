@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::atomic::AtomicU32;
 
 pub const BRIDGE_MAGIC: u32 = 0x5A465842; // 'ZFXB'
@@ -88,9 +90,12 @@ impl ZfxSharedBridge {
     pub fn init_header(&mut self) {
         self.magic = BRIDGE_MAGIC;
         self.host_seq.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.worker_seq.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.command.store(CMD_IDLE, std::sync::atomic::Ordering::Relaxed);
-        self.status.store(STATUS_READY, std::sync::atomic::Ordering::Relaxed);
+        self.worker_seq
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.command
+            .store(CMD_IDLE, std::sync::atomic::Ordering::Relaxed);
+        self.status
+            .store(STATUS_READY, std::sync::atomic::Ordering::Relaxed);
         self.sample_rate = 44100.0;
         self.block_size = 256;
         self.num_frames = 0;

@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicU32;
 
-pub const BRIDGE_MAGIC: u32 = 0x5A465842; // 'ZFXB'
+pub const BRIDGE_MAGIC: u32 = 0x5A46_5842; // 'ZFXB'
 pub const MAX_FRAMES: usize = 4096;
 pub const MAX_PARAMS: usize = 128;
 pub const MAX_PARAM_QUEUE: usize = 64;
@@ -41,6 +41,7 @@ impl Default for ParamMeta {
     }
 }
 
+/// Shared memory layout exchanged between 64-bit CLAP host and 32-bit DSP worker.
 #[repr(C)]
 pub struct ZfxSharedBridge {
     pub magic: u32,
@@ -49,31 +50,27 @@ pub struct ZfxSharedBridge {
     pub command: AtomicU32,
     pub status: AtomicU32,
 
-    // Audio config
     pub sample_rate: f32,
     pub block_size: u32,
     pub num_frames: u32,
 
-    // Host Transport / Tempo sync
     pub tempo: f64,
     pub beat_pos: f64,
     pub time_sig_num: u16,
     pub time_sig_denom: u16,
     pub is_playing: u8,
     pub has_tempo: u8,
-    pub _pad: [u8; 2],
+    pub pad: [u8; 2],
 
-    // Plugin introspection from worker
     pub num_params: u32,
     pub num_inputs: u32,
     pub num_outputs: u32,
+
     pub params: [ParamMeta; MAX_PARAMS],
 
-    // Automation / parameter change queue from host
     pub num_param_changes: u32,
     pub param_queue: [ParamChange; MAX_PARAM_QUEUE],
 
-    // Audio streaming buffers (planar stereo f32)
     pub in_l: [f32; MAX_FRAMES],
     pub in_r: [f32; MAX_FRAMES],
     pub out_l: [f32; MAX_FRAMES],
@@ -88,9 +85,12 @@ impl ZfxSharedBridge {
     pub fn init_header(&mut self) {
         self.magic = BRIDGE_MAGIC;
         self.host_seq.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.worker_seq.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.command.store(CMD_IDLE, std::sync::atomic::Ordering::Relaxed);
-        self.status.store(STATUS_READY, std::sync::atomic::Ordering::Relaxed);
+        self.worker_seq
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.command
+            .store(CMD_IDLE, std::sync::atomic::Ordering::Relaxed);
+        self.status
+            .store(STATUS_READY, std::sync::atomic::Ordering::Relaxed);
         self.sample_rate = 44100.0;
         self.block_size = 256;
         self.num_frames = 0;
@@ -100,7 +100,7 @@ impl ZfxSharedBridge {
         self.time_sig_denom = 4;
         self.is_playing = 0;
         self.has_tempo = 1;
-        self._pad = [0; 2];
+        self.pad = [0; 2];
         self.num_params = 0;
         self.num_inputs = 2;
         self.num_outputs = 2;
@@ -109,16 +109,18 @@ impl ZfxSharedBridge {
     }
 }
 
+/// # Safety
+///
+/// `val_addr` must be non-null and point to a valid, aligned `AtomicU32` in shared memory.
 #[inline]
 pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: Option<u64>) {
     let ts = timeout_us.map(|us| libc::timespec {
-        tv_sec: (us / 1_000_000) as libc::time_t,
-        tv_nsec: ((us % 1_000_000) * 1_000) as libc::c_long,
+        tv_sec: (us / 1_000_000).cast_signed(),
+        tv_nsec: ((us % 1_000_000) * 1_000).cast_signed(),
     });
-    let ts_ptr = match &ts {
-        Some(t) => t as *const libc::timespec,
-        None => std::ptr::null(),
-    };
+    let ts_ptr = ts
+        .as_ref()
+        .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>);
     libc::syscall(
         libc::SYS_futex,
         val_addr,
@@ -130,6 +132,9 @@ pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: 
     );
 }
 
+/// # Safety
+///
+/// `val_addr` must be non-null and point to a valid, aligned `AtomicU32` in shared memory.
 #[inline]
 pub unsafe fn futex_wake(val_addr: *const AtomicU32) {
     libc::syscall(
