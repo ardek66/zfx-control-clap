@@ -1,5 +1,4 @@
 use goblin::pe::PE;
-use once_cell::sync::Lazy;
 use std::ffi::{c_void, CStr};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -13,6 +12,7 @@ pub struct PeModule {
 
 impl PeModule {
     /// Loads a PE image from raw bytes into executable memory.
+    #[allow(clippy::too_many_lines)]
     pub fn load(raw_dll_bytes: &[u8]) -> Result<Self, &'static str> {
         let pe = PE::parse(raw_dll_bytes).map_err(|_| "Failed to parse PE")?;
 
@@ -21,14 +21,17 @@ impl PeModule {
         }
 
         let opt_hdr = pe.header.optional_header.ok_or("Missing Optional Header")?;
-        let size_of_image = opt_hdr.windows_fields.size_of_image as usize;
-        let image_base = opt_hdr.windows_fields.image_base as usize;
+        let size_of_image = usize::try_from(opt_hdr.windows_fields.size_of_image)
+            .map_err(|_| "SizeOfImage overflow")?;
+        let image_base =
+            usize::try_from(opt_hdr.windows_fields.image_base).map_err(|_| "ImageBase overflow")?;
 
         if size_of_image == 0 {
             return Err("Invalid SizeOfImage");
         }
 
         // 1. Allocate executable memory for the full image
+        // SAFETY: Allocating private anonymous page-aligned memory for the PE image.
         let base_addr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -44,10 +47,12 @@ impl PeModule {
             return Err("Failed to allocate executable memory via mmap");
         }
 
-        let base_ptr = base_addr as *mut u8;
+        let base_ptr = base_addr.cast::<u8>();
 
         // 2. Copy PE headers
-        let size_of_headers = opt_hdr.windows_fields.size_of_headers as usize;
+        let size_of_headers = usize::try_from(opt_hdr.windows_fields.size_of_headers)
+            .map_err(|_| "SizeOfHeaders overflow")?;
+        // SAFETY: Copying PE headers to base_ptr within allocated size_of_image.
         unsafe {
             ptr::copy_nonoverlapping(
                 raw_dll_bytes.as_ptr(),
@@ -59,12 +64,13 @@ impl PeModule {
         // 3. Copy PE sections to their virtual addresses
         for section in &pe.sections {
             if section.size_of_raw_data > 0 {
-                let raw_start = section.pointer_to_raw_data as usize;
-                let raw_size = section.size_of_raw_data as usize;
-                let virt_start = section.virtual_address as usize;
+                let raw_start = usize::try_from(section.pointer_to_raw_data).unwrap_or(0);
+                let raw_size = usize::try_from(section.size_of_raw_data).unwrap_or(0);
+                let virt_start = usize::try_from(section.virtual_address).unwrap_or(0);
                 if raw_start + raw_size <= raw_dll_bytes.len()
                     && virt_start + raw_size <= size_of_image
                 {
+                    // SAFETY: Copying PE section raw bytes into mapped section memory.
                     unsafe {
                         ptr::copy_nonoverlapping(
                             raw_dll_bytes.as_ptr().add(raw_start),
@@ -77,21 +83,23 @@ impl PeModule {
         }
 
         // 4. Apply Base Relocations if the image was not loaded at image_base
-        let delta = (base_ptr as usize as isize).wrapping_sub(image_base as isize);
-        eprintln!(
-            "[peldr] base_ptr={:?}, image_base={:#x}, delta={:#x}",
-            base_ptr, image_base, delta
-        );
+        let delta = base_ptr
+            .addr()
+            .cast_signed()
+            .wrapping_sub(image_base.cast_signed());
+        eprintln!("[peldr] base_ptr={base_ptr:?}, image_base={image_base:#x}, delta={delta:#x}");
         if delta != 0 {
+            // SAFETY: Applying relocations across valid mapped PE section memory.
             unsafe {
-                Self::apply_relocations(base_ptr, raw_dll_bytes, delta)?;
+                Self::apply_relocations(base_ptr, raw_dll_bytes, delta);
             }
         }
         eprintln!("[peldr] Relocations applied successfully");
 
         // 5. Resolve Imports into the IAT
+        // SAFETY: Resolving imported Win32 and CRT functions into the mapped IAT.
         unsafe {
-            Self::resolve_imports(base_ptr, raw_dll_bytes)?;
+            Self::resolve_imports(base_ptr, raw_dll_bytes);
         }
         eprintln!("[peldr] Imports resolved successfully");
 
@@ -102,10 +110,11 @@ impl PeModule {
         // A `ret` (0xc3) preserves stack balance, whereas `ret 8` corrupted the caller's stack frame!
         let sig = [0x81u8, 0xec, 0x4c, 0x04, 0x00, 0x00];
         let patch = [0xb0u8, 0x01, 0xc3, 0x90, 0x90, 0x90];
+        // SAFETY: Slicing the full mapped PE image memory to locate and patch dongle routine.
         let mem_slice = unsafe { std::slice::from_raw_parts_mut(base_ptr, size_of_image) };
         if let Some(pos) = mem_slice.windows(sig.len()).position(|w| w == sig) {
             mem_slice[pos..pos + patch.len()].copy_from_slice(&patch);
-            eprintln!("[peldr] Hardware dongle check bypassed at RVA {:#x}", pos);
+            eprintln!("[peldr] Hardware dongle check bypassed at RVA {pos:#x}");
         }
 
         Ok(Self {
@@ -115,85 +124,96 @@ impl PeModule {
     }
 
     /// Applies base relocations from the .reloc directory
-    unsafe fn apply_relocations(
-        base_ptr: *mut u8,
-        raw_dll: &[u8],
-        delta: isize,
-    ) -> Result<(), &'static str> {
-        let pe_off = u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap()) as usize;
+    // SAFETY: Relocation targets can be unaligned in raw PE sections; read_unaligned and write_unaligned are used.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn apply_relocations(base_ptr: *mut u8, raw_dll: &[u8], delta: isize) {
+        let pe_off =
+            usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
         let opt_off = pe_off + 24;
         // DataDirectory[5] is Base Relocation Table (offset 136 in optional header)
         if opt_off + 144 > raw_dll.len() {
-            return Ok(());
+            return;
         }
-        let reloc_rva =
-            u32::from_le_bytes(raw_dll[opt_off + 136..opt_off + 140].try_into().unwrap()) as usize;
-        let reloc_size =
-            u32::from_le_bytes(raw_dll[opt_off + 140..opt_off + 144].try_into().unwrap()) as usize;
+        let reloc_rva = usize::try_from(u32::from_le_bytes(
+            raw_dll[opt_off + 136..opt_off + 140].try_into().unwrap(),
+        ))
+        .unwrap();
+        let reloc_size = usize::try_from(u32::from_le_bytes(
+            raw_dll[opt_off + 140..opt_off + 144].try_into().unwrap(),
+        ))
+        .unwrap();
 
         if reloc_rva == 0 || reloc_size == 0 {
-            return Ok(());
+            return;
         }
 
         let mut cur = 0;
         while cur < reloc_size {
             let block_ptr = base_ptr.add(reloc_rva + cur);
-            let page_rva = ptr::read_unaligned(block_ptr as *const u32) as usize;
-            let block_size = ptr::read_unaligned(block_ptr.add(4) as *const u32) as usize;
+            let page_rva = usize::try_from(ptr::read_unaligned(block_ptr.cast::<u32>())).unwrap();
+            let block_size =
+                usize::try_from(ptr::read_unaligned(block_ptr.add(4).cast::<u32>())).unwrap();
 
-            if block_size == 0 || block_size < 8 {
+            if block_size < 8 {
                 break;
             }
 
             let num_entries = (block_size - 8) / 2;
             for i in 0..num_entries {
-                let entry = ptr::read_unaligned(block_ptr.add(8 + i * 2) as *const u16);
+                let entry = ptr::read_unaligned(block_ptr.add(8 + i * 2).cast::<u16>());
                 let rtype = entry >> 12;
-                let roffset = (entry & 0x0FFF) as usize;
+                let roffset = usize::from(entry & 0x0FFF);
 
                 if rtype == 3 {
                     // IMAGE_REL_BASED_HIGHLOW (32-bit delta adjustment)
-                    let patch_addr = base_ptr.add(page_rva + roffset) as *mut u32;
+                    let patch_addr = base_ptr.add(page_rva + roffset).cast::<u32>();
                     let old_val = ptr::read_unaligned(patch_addr);
-                    let new_val = old_val.wrapping_add(delta as u32);
+                    let delta_u32 = u32::try_from(delta.cast_unsigned()).unwrap();
+                    let new_val = old_val.wrapping_add(delta_u32);
                     ptr::write_unaligned(patch_addr, new_val);
                 }
             }
             cur += block_size;
         }
-
-        Ok(())
     }
 
     /// Resolves external Win32 / CRT functions into the Import Address Table (IAT)
-    unsafe fn resolve_imports(base_ptr: *mut u8, raw_dll: &[u8]) -> Result<(), &'static str> {
-        let pe_off = u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap()) as usize;
+    // SAFETY: Writing function pointers into pointer-aligned IAT slots.
+    #[allow(clippy::cast_ptr_alignment)]
+    unsafe fn resolve_imports(base_ptr: *mut u8, raw_dll: &[u8]) {
+        let pe_off =
+            usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
         let opt_off = pe_off + 24;
         // DataDirectory[1] is Import Table (offset 104 in optional header)
         if opt_off + 112 > raw_dll.len() {
-            return Ok(());
+            return;
         }
-        let imp_rva =
-            u32::from_le_bytes(raw_dll[opt_off + 104..opt_off + 108].try_into().unwrap()) as usize;
-        let imp_size =
-            u32::from_le_bytes(raw_dll[opt_off + 108..opt_off + 112].try_into().unwrap()) as usize;
+        let imp_rva = usize::try_from(u32::from_le_bytes(
+            raw_dll[opt_off + 104..opt_off + 108].try_into().unwrap(),
+        ))
+        .unwrap();
+        let imp_size = usize::try_from(u32::from_le_bytes(
+            raw_dll[opt_off + 108..opt_off + 112].try_into().unwrap(),
+        ))
+        .unwrap();
 
         if imp_rva == 0 || imp_size == 0 {
-            return Ok(());
+            return;
         }
 
         let mut desc_idx = 0;
         loop {
             let desc_ptr = base_ptr.add(imp_rva + desc_idx * 20);
-            let oft = ptr::read_unaligned(desc_ptr as *const u32) as usize;
-            let name_rva = ptr::read_unaligned(desc_ptr.add(12) as *const u32) as usize;
-            let ft = ptr::read_unaligned(desc_ptr.add(16) as *const u32) as usize;
+            let oft = usize::try_from(ptr::read_unaligned(desc_ptr.cast::<u32>())).unwrap();
+            let name_rva =
+                usize::try_from(ptr::read_unaligned(desc_ptr.add(12).cast::<u32>())).unwrap();
+            let ft = usize::try_from(ptr::read_unaligned(desc_ptr.add(16).cast::<u32>())).unwrap();
 
             if name_rva == 0 && ft == 0 {
                 break; // End of import descriptors
             }
 
-            let dll_name_str = CStr::from_ptr(base_ptr.add(name_rva) as *const i8)
+            let dll_name_str = CStr::from_ptr(base_ptr.add(name_rva).cast::<std::ffi::c_char>())
                 .to_string_lossy()
                 .to_lowercase();
 
@@ -203,24 +223,23 @@ impl PeModule {
             let mut slot_idx = 0;
             loop {
                 let thunk_entry =
-                    ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4) as *const u32);
+                    ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4).cast::<u32>());
                 if thunk_entry == 0 {
                     break;
                 }
 
-                let target_iat = base_ptr.add(iat_rva + slot_idx * 4) as *mut *mut c_void;
+                let target_iat = base_ptr.add(iat_rva + slot_idx * 4).cast::<*mut c_void>();
 
-                if (thunk_entry & 0x80000000) == 0 {
+                if (thunk_entry & 0x8000_0000) == 0 {
                     // Import by name
-                    let name_entry_ptr = base_ptr.add(thunk_entry as usize);
+                    let name_entry_rva = usize::try_from(thunk_entry).unwrap();
+                    let name_entry_ptr = base_ptr.add(name_entry_rva);
                     let func_name =
-                        CStr::from_ptr(name_entry_ptr.add(2) as *const i8).to_string_lossy();
+                        CStr::from_ptr(name_entry_ptr.add(2).cast::<std::ffi::c_char>())
+                            .to_string_lossy();
 
                     let hook_ptr = resolve_import_symbol(&dll_name_str, &func_name);
-                    eprintln!(
-                        "[peldr import] {}!{} -> {:?}",
-                        dll_name_str, func_name, hook_ptr
-                    );
+                    eprintln!("[peldr import] {dll_name_str}!{func_name} -> {hook_ptr:?}");
                     *target_iat = hook_ptr;
                 }
 
@@ -229,40 +248,53 @@ impl PeModule {
 
             desc_idx += 1;
         }
-
-        Ok(())
     }
 
     /// Resolves an exported function by name from the EAT (Export Address Table)
     pub fn get_export(&self, name: &str) -> Option<*mut c_void> {
-        let base_ptr = self.base_addr as *mut u8;
+        let base_ptr = self.base_addr.cast::<u8>();
+        // SAFETY: Reading export directory and functions tables from mapped PE.
         unsafe {
-            let pe_off = ptr::read_unaligned(base_ptr.add(0x3c) as *const u32) as usize;
+            let pe_off =
+                usize::try_from(ptr::read_unaligned(base_ptr.add(0x3c).cast::<u32>())).unwrap();
             let opt_off = pe_off + 24;
-            let exp_rva = ptr::read_unaligned(base_ptr.add(opt_off + 96) as *const u32) as usize;
+            let exp_rva = usize::try_from(ptr::read_unaligned(
+                base_ptr.add(opt_off + 96).cast::<u32>(),
+            ))
+            .unwrap();
             if exp_rva == 0 {
                 return None;
             }
 
             let exp_ptr = base_ptr.add(exp_rva);
-            let num_functions = ptr::read_unaligned(exp_ptr.add(20) as *const u32) as usize;
-            let num_names = ptr::read_unaligned(exp_ptr.add(24) as *const u32) as usize;
-            let funcs_rva = ptr::read_unaligned(exp_ptr.add(28) as *const u32) as usize;
-            let names_rva = ptr::read_unaligned(exp_ptr.add(32) as *const u32) as usize;
-            let ords_rva = ptr::read_unaligned(exp_ptr.add(36) as *const u32) as usize;
+            let num_functions =
+                usize::try_from(ptr::read_unaligned(exp_ptr.add(20).cast::<u32>())).unwrap();
+            let num_names =
+                usize::try_from(ptr::read_unaligned(exp_ptr.add(24).cast::<u32>())).unwrap();
+            let funcs_rva =
+                usize::try_from(ptr::read_unaligned(exp_ptr.add(28).cast::<u32>())).unwrap();
+            let names_rva =
+                usize::try_from(ptr::read_unaligned(exp_ptr.add(32).cast::<u32>())).unwrap();
+            let ords_rva =
+                usize::try_from(ptr::read_unaligned(exp_ptr.add(36).cast::<u32>())).unwrap();
 
             for i in 0..num_names {
-                let n_rva =
-                    ptr::read_unaligned(base_ptr.add(names_rva + i * 4) as *const u32) as usize;
-                let sym_name = CStr::from_ptr(base_ptr.add(n_rva) as *const i8).to_string_lossy();
+                let n_rva = usize::try_from(ptr::read_unaligned(
+                    base_ptr.add(names_rva + i * 4).cast::<u32>(),
+                ))
+                .unwrap();
+                let sym_name = CStr::from_ptr(base_ptr.add(n_rva).cast::<std::ffi::c_char>())
+                    .to_string_lossy();
                 if sym_name == name {
-                    let ord =
-                        ptr::read_unaligned(base_ptr.add(ords_rva + i * 2) as *const u16) as usize;
+                    let ord = usize::from(ptr::read_unaligned(
+                        base_ptr.add(ords_rva + i * 2).cast::<u16>(),
+                    ));
                     if ord < num_functions {
-                        let fn_rva =
-                            ptr::read_unaligned(base_ptr.add(funcs_rva + ord * 4) as *const u32)
-                                as usize;
-                        return Some(base_ptr.add(fn_rva) as *mut c_void);
+                        let fn_rva = usize::try_from(ptr::read_unaligned(
+                            base_ptr.add(funcs_rva + ord * 4).cast::<u32>(),
+                        ))
+                        .unwrap();
+                        return Some(base_ptr.add(fn_rva).cast::<c_void>());
                     }
                 }
             }
@@ -270,54 +302,56 @@ impl PeModule {
         None
     }
 
-    /// Resolves the ZTypeIF export
+    /// Resolves the `ZTypeIF` export
     #[allow(dead_code)]
     pub fn get_ztypeif(&self) -> Result<extern "C" fn(), &'static str> {
         let export_fn = self
             .get_export("ZTypeIF")
             .or_else(|| self.get_export("getinterface"))
             .ok_or("Failed to locate ZTypeIF export")?;
+        // SAFETY: Transmuting verified raw export pointer to extern C function signature.
         Ok(unsafe { std::mem::transmute::<*mut c_void, extern "C" fn()>(export_fn) })
     }
 
-    /// Resolves ZTypeIF or getinterface and initializes the DSP instance with host callback
+    /// Resolves `ZTypeIF` or getinterface and initializes the DSP instance with host callback
     pub fn init_zfx_plugin(&self) -> Result<ZfxDspInstance, &'static str> {
         let export_fn = self
             .get_export("ZTypeIF")
             .or_else(|| self.get_export("getinterface"))
             .ok_or("Failed to locate ZTypeIF or getinterface export in PE")?;
 
-        eprintln!("[peldr] Located getinterface export at {:?}", export_fn);
+        eprintln!("[peldr] Located getinterface export at {export_fn:?}");
 
         // Ensure Win32 TEB and FS segment register are initialized
         init_win32_teb();
 
+        // SAFETY: Transmuting getinterface export pointer to function signature.
         let getinterface: extern "C" fn(host_callback: *const c_void) -> *mut c_void =
             unsafe { std::mem::transmute(export_fn) };
 
-        eprintln!(
-            "[peldr] Calling getinterface({:?})...",
-            default_audio_master as *const c_void
-        );
+        // SAFETY: Converting default_audio_master host callback function pointer to raw C pointer.
+        #[allow(clippy::as_conversions)]
+        let host_cb_ptr = default_audio_master as *const c_void;
+        eprintln!("[peldr] Calling getinterface({host_cb_ptr:?})...");
+        // SAFETY: Invoking getinterface with default_audio_master host callback under Win32ContextGuard.
         let instance = unsafe {
             let _guard = Win32ContextGuard::enter();
-            getinterface(default_audio_master as *const c_void)
+            getinterface(host_cb_ptr)
         };
-        eprintln!(
-            "[peldr] Returned from getinterface: instance={:?}",
-            instance
-        );
+        eprintln!("[peldr] Returned from getinterface: instance={instance:?}");
         if instance.is_null() {
             return Err("getinterface returned null pointer");
         }
 
-        let iface = instance as *mut *mut c_void;
-        let effect = unsafe { *iface.add(1) as *mut AEffect };
+        let iface = instance.cast::<*mut c_void>();
+        // SAFETY: Reading AEffect pointer from second slot of Zfx iface wrapper.
+        let effect = unsafe { (*iface.add(1)).cast::<AEffect>() };
         if effect.is_null() {
             return Err("AEffect pointer is null");
         }
+        // SAFETY: Reading magic number from non-null AEffect pointer.
         let magic = unsafe { (*effect).magic };
-        if magic != 0x56737450 {
+        if magic != 0x5673_7450 {
             return Err("AEffect magic does not match 'VstP'");
         }
 
@@ -332,7 +366,7 @@ impl PeModule {
 pub struct AEffect {
     pub magic: i32, // 'VstP' (0x56737450)
     pub dispatcher: unsafe extern "C" fn(
-        effect: *mut AEffect,
+        effect: *mut Self,
         opcode: i32,
         index: i32,
         value: isize,
@@ -340,13 +374,13 @@ pub struct AEffect {
         opt: f32,
     ) -> isize,
     pub process: unsafe extern "C" fn(
-        effect: *mut AEffect,
+        effect: *mut Self,
         inputs: *const *const f32,
         outputs: *mut *mut f32,
         sampleframes: i32,
     ),
-    pub set_parameter: unsafe extern "C" fn(effect: *mut AEffect, index: i32, parameter: f32),
-    pub get_parameter: unsafe extern "C" fn(effect: *mut AEffect, index: i32) -> f32,
+    pub set_parameter: unsafe extern "C" fn(effect: *mut Self, index: i32, parameter: f32),
+    pub get_parameter: unsafe extern "C" fn(effect: *mut Self, index: i32) -> f32,
     pub num_programs: i32,
     pub num_params: i32,
     pub num_inputs: i32,
@@ -363,7 +397,7 @@ pub struct AEffect {
     pub unique_id: i32,
     pub version: i32,
     pub process_replacing: unsafe extern "C" fn(
-        effect: *mut AEffect,
+        effect: *mut Self,
         inputs: *const *const f32,
         outputs: *mut *mut f32,
         sampleframes: i32,
@@ -378,11 +412,14 @@ pub struct ZfxDspInstance {
     pub effect: *mut AEffect,
 }
 
+// SAFETY: ZfxDspInstance wraps raw VST 2.4 pointers which are thread-safe when synchronized by the host.
 unsafe impl Send for ZfxDspInstance {}
+// SAFETY: Concurrent parameter inspection is guarded by the host audio processing loop.
 unsafe impl Sync for ZfxDspInstance {}
 
 impl ZfxDspInstance {
     pub fn open(&self) {
+        // SAFETY: Invoking VST 2.4 effOpen dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 0 = effOpen in VST 2.4
@@ -391,6 +428,7 @@ impl ZfxDspInstance {
     }
 
     pub fn close(&self) {
+        // SAFETY: Invoking VST 2.4 effClose dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 1 = effClose in VST 2.4
@@ -399,19 +437,23 @@ impl ZfxDspInstance {
     }
 
     pub fn num_params(&self) -> i32 {
+        // SAFETY: Reading parameter count from validated effect pointer.
         unsafe { (*self.effect).num_params }
     }
 
     pub fn num_inputs(&self) -> i32 {
+        // SAFETY: Reading input count from validated effect pointer.
         unsafe { (*self.effect).num_inputs }
     }
 
     pub fn num_outputs(&self) -> i32 {
+        // SAFETY: Reading output count from validated effect pointer.
         unsafe { (*self.effect).num_outputs }
     }
 
     pub fn get_parameter_name(&self, index: i32) -> String {
         let mut buf = [0u8; 32];
+        // SAFETY: Querying parameter name buffer from plugin dispatcher under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 8 = effGetParamName
@@ -420,7 +462,7 @@ impl ZfxDspInstance {
                 8,
                 index,
                 0,
-                buf.as_mut_ptr() as *mut c_void,
+                buf.as_mut_ptr().cast::<c_void>(),
                 0.0,
             );
         }
@@ -429,6 +471,7 @@ impl ZfxDspInstance {
     }
 
     pub fn set_parameter(&self, index: i32, value: f32) {
+        // SAFETY: Invoking set_parameter function pointer on valid effect under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             ((*self.effect).set_parameter)(self.effect, index, value);
@@ -436,6 +479,7 @@ impl ZfxDspInstance {
     }
 
     pub fn get_parameter(&self, index: i32) -> f32 {
+        // SAFETY: Invoking get_parameter function pointer on valid effect under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             ((*self.effect).get_parameter)(self.effect, index)
@@ -448,8 +492,9 @@ impl ZfxDspInstance {
         outputs: *mut *mut f64,
         sample_frames: i32,
     ) {
+        // SAFETY: Executing C++ virtual method for 64-bit audio replacement using x86 thiscall/fastcall ABI.
         unsafe {
-            let obj = (*self.effect).object as *mut *mut usize;
+            let obj = (*self.effect).object.cast::<*mut usize>();
             let vtable = *obj;
             let dsp_proc_fn = *vtable.add(9);
             let _guard = Win32ContextGuard::enter();
@@ -474,8 +519,10 @@ impl ZfxDspInstance {
         }
         // VST DSP engines in Zoom ZFX (including Analog_Delay) unconditionally dereference
         // at least 2 input channel pointers and 2 output channel pointers!
-        let dsp_ins = unsafe { (*self.effect).num_inputs.max(2) as usize };
-        let dsp_outs = unsafe { (*self.effect).num_outputs.max(2) as usize };
+        // SAFETY: Reading channel counts from validated effect pointer.
+        let dsp_ins = usize::try_from(unsafe { (*self.effect).num_inputs }.max(2)).unwrap_or(2);
+        // SAFETY: Reading channel counts from validated effect pointer.
+        let dsp_outs = usize::try_from(unsafe { (*self.effect).num_outputs }.max(2)).unwrap_or(2);
 
         // Prepare 64-bit input buffers
         let in_f64: Vec<Vec<f64>> = (0..dsp_ins)
@@ -483,28 +530,32 @@ impl ZfxDspInstance {
                 if inputs.is_empty() {
                     vec![0.0f64; frames]
                 } else if ch < inputs.len() {
-                    inputs[ch].iter().map(|&s| s as f64).collect()
+                    inputs[ch].iter().map(|&s| f64::from(s)).collect()
                 } else {
                     // If DSP requires channel 1 but host only provided channel 0, duplicate channel 0
-                    inputs[0].iter().map(|&s| s as f64).collect()
+                    inputs[0].iter().map(|&s| f64::from(s)).collect()
                 }
             })
             .collect();
 
         let mut out_f64: Vec<Vec<f64>> = (0..dsp_outs).map(|_| vec![0.0f64; frames]).collect();
 
-        let in_ptrs: Vec<*const f64> = in_f64.iter().map(|b| b.as_ptr()).collect();
-        let mut out_ptrs: Vec<*mut f64> = out_f64.iter_mut().map(|b| b.as_mut_ptr()).collect();
+        let in_ptrs: Vec<*const f64> = in_f64.iter().map(std::vec::Vec::as_ptr).collect();
+        let mut out_ptrs: Vec<*mut f64> =
+            out_f64.iter_mut().map(std::vec::Vec::as_mut_ptr).collect();
 
-        self.process_replacing_f64(in_ptrs.as_ptr(), out_ptrs.as_mut_ptr(), frames as i32);
+        let frames_i32 = i32::try_from(frames).unwrap_or(0);
+        self.process_replacing_f64(in_ptrs.as_ptr(), out_ptrs.as_mut_ptr(), frames_i32);
 
         // Copy back to host outputs
         for (ch, out_buf) in outputs.iter_mut().enumerate() {
             let src_ch = if ch < dsp_outs { ch } else { 0 };
             if src_ch < out_f64.len() {
                 for (s_out, &s_in) in out_buf.iter_mut().zip(out_f64[src_ch].iter()) {
+                    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                    let s_f32 = s_in as f32;
                     *s_out = if s_in.is_finite() {
-                        (s_in as f32).clamp(-10.0, 10.0)
+                        s_f32.clamp(-10.0, 10.0)
                     } else {
                         0.0
                     };
@@ -520,6 +571,7 @@ impl ZfxDspInstance {
         outputs: *mut *mut f32,
         sample_frames: i32,
     ) {
+        // SAFETY: Invoking standard VST 2.4 process_replacing callback under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             ((*self.effect).process_replacing)(self.effect, inputs, outputs, sample_frames);
@@ -527,7 +579,10 @@ impl ZfxDspInstance {
     }
 
     pub fn set_sample_rate(&self, sample_rate: f32) {
-        CURRENT_SAMPLE_RATE.store(sample_rate as i32, Ordering::Relaxed);
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let sr_i32 = sample_rate as i32;
+        CURRENT_SAMPLE_RATE.store(sr_i32, Ordering::Relaxed);
+        // SAFETY: Invoking VST 2.4 effSetSampleRate dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 10 = effSetSampleRate in VST 2.4
@@ -537,6 +592,7 @@ impl ZfxDspInstance {
 
     pub fn set_block_size(&self, block_size: i32) {
         CURRENT_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
+        // SAFETY: Invoking VST 2.4 effSetBlockSize dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 11 = effSetBlockSize in VST 2.4
@@ -544,7 +600,7 @@ impl ZfxDspInstance {
                 self.effect,
                 11,
                 0,
-                block_size as isize,
+                isize::try_from(block_size).unwrap_or(0),
                 ptr::null_mut(),
                 0.0,
             );
@@ -552,6 +608,7 @@ impl ZfxDspInstance {
     }
 
     pub fn resume(&self) {
+        // SAFETY: Invoking VST 2.4 effMainsChanged (start) dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 12 = effMainsChanged (1 = resume / start processing)
@@ -560,6 +617,7 @@ impl ZfxDspInstance {
     }
 
     pub fn suspend(&self) {
+        // SAFETY: Invoking VST 2.4 effMainsChanged (stop) dispatcher opcode under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 12 = effMainsChanged (0 = suspend / stop processing)
@@ -570,6 +628,7 @@ impl ZfxDspInstance {
 
 impl Drop for PeModule {
     fn drop(&mut self) {
+        // SAFETY: Unmapping memory allocated via libc::mmap during PeModule::load.
         unsafe {
             libc::munmap(self.base_addr, self.size);
         }
@@ -626,25 +685,28 @@ pub unsafe extern "C" fn default_audio_master(
     _ptr: *mut c_void,
     opt: f32,
 ) -> isize {
-    eprintln!(
-        "[default_audio_master] opcode={}, index={}, value={}, opt={}",
-        opcode, index, value, opt
-    );
+    eprintln!("[default_audio_master] opcode={opcode}, index={index}, value={value}, opt={opt}");
     match opcode {
         1 => 2400, // audioMasterVersion (VST 2.4)
         7 => {
             // audioMasterGetTime (VST 2.4) - requested by delays, tap-tempo, beat-sync effects
-            CURRENT_TIME_INFO.sample_rate = CURRENT_SAMPLE_RATE.load(Ordering::Relaxed) as f64;
-            &raw const CURRENT_TIME_INFO as isize
+            CURRENT_TIME_INFO.sample_rate = f64::from(CURRENT_SAMPLE_RATE.load(Ordering::Relaxed));
+            (&raw const CURRENT_TIME_INFO).addr().cast_signed()
         }
-        16 => CURRENT_SAMPLE_RATE.load(Ordering::Relaxed) as isize, // audioMasterGetSampleRate
-        17 => CURRENT_BLOCK_SIZE.load(Ordering::Relaxed) as isize,  // audioMasterGetBlockSize
+        16 => isize::try_from(CURRENT_SAMPLE_RATE.load(Ordering::Relaxed)).unwrap_or(0), // audioMasterGetSampleRate
+        17 => isize::try_from(CURRENT_BLOCK_SIZE.load(Ordering::Relaxed)).unwrap_or(0), // audioMasterGetBlockSize
         _ => 0, // In VST 2.4, unknown/unsupported opcodes MUST return 0 (NULL/false), NEVER 1!
     }
 }
 
 // --- Import Symbol Dispatcher ---
 
+// Dispatches imported DLL symbol names to function hook pointer addresses.
+#[allow(
+    clippy::too_many_lines,
+    clippy::as_conversions,
+    clippy::fn_to_numeric_cast
+)]
 fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
     match (dll, func) {
         // SETUPAPI.dll (Hardware Dongle Protection Spoofing)
@@ -691,12 +753,10 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
         ("kernel32.dll", "TerminateProcess") => hook_TerminateProcess as *mut c_void,
 
         // MSVCR80.dll (Memory, String, and Math)
-        ("msvcr80.dll", "_malloc_crt")
-        | ("msvcr80.dll", "??2@YAPAXI@Z")
-        | ("msvcr80.dll", "??_U@YAPAXI@Z") => hook_malloc as *mut c_void,
-        ("msvcr80.dll", "free")
-        | ("msvcr80.dll", "??3@YAXPAX@Z")
-        | ("msvcr80.dll", "??_V@YAXPAX@Z") => hook_free as *mut c_void,
+        ("msvcr80.dll", "_malloc_crt" | "??2@YAPAXI@Z" | "??_U@YAPAXI@Z") => {
+            hook_malloc as *mut c_void
+        }
+        ("msvcr80.dll", "free" | "??3@YAXPAX@Z" | "??_V@YAXPAX@Z") => hook_free as *mut c_void,
         ("msvcr80.dll", "memcpy") => libc::memcpy as *mut c_void,
         ("msvcr80.dll", "memset") => libc::memset as *mut c_void,
         ("msvcr80.dll", "strncpy") => libc::strncpy as *mut c_void,
@@ -718,33 +778,31 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
         ("msvcr80.dll", "__libm_sse2_tan") => hook_tan as *mut c_void,
 
         // CRT internals
-        ("msvcr80.dll", "_initterm") | ("msvcr80.dll", "_initterm_e") => {
-            hook_initterm as *mut c_void
-        }
-        ("msvcr80.dll", "_encode_pointer") | ("msvcr80.dll", "_decode_pointer") => {
+        ("msvcr80.dll", "_initterm" | "_initterm_e") => hook_initterm as *mut c_void,
+        ("msvcr80.dll", "_encode_pointer" | "_decode_pointer" | "__RTDynamicCast") => {
             hook_identity as *mut c_void
         }
         ("msvcr80.dll", "_encoded_null") => hook_null as *mut c_void,
-        ("msvcr80.dll", "_lock") | ("msvcr80.dll", "_unlock") | ("msvcr80.dll", "_amsg_exit") => {
-            hook_noop as *mut c_void
-        }
-        ("msvcr80.dll", "_crt_debugger_hook") => hook_noop as *mut c_void,
+        (
+            "msvcr80.dll",
+            "_lock"
+            | "_unlock"
+            | "_amsg_exit"
+            | "_crt_debugger_hook"
+            | "?terminate@@YAXXZ"
+            | "?_type_info_dtor_internal_method@type_info@@QAEXXZ"
+            | "__clean_type_info_names_internal",
+        ) => hook_noop as *mut c_void,
         ("msvcr80.dll", "_onexit") => hook_onexit as *mut c_void,
         ("msvcr80.dll", "__dllonexit") => hook_dllonexit as *mut c_void,
         ("msvcr80.dll", "_purecall") => hook_purecall as *mut c_void,
-        ("msvcr80.dll", "?terminate@@YAXXZ") => hook_noop as *mut c_void,
-        ("msvcr80.dll", "__CppXcptFilter")
-        | ("msvcr80.dll", "_except_handler4_common")
-        | ("msvcr80.dll", "__CxxFrameHandler3") => hook_zero as *mut c_void,
-        ("msvcr80.dll", "?_type_info_dtor_internal_method@type_info@@QAEXXZ") => {
-            hook_noop as *mut c_void
+        ("msvcr80.dll", "__CppXcptFilter" | "_except_handler4_common" | "__CxxFrameHandler3") => {
+            hook_zero as *mut c_void
         }
-        ("msvcr80.dll", "__clean_type_info_names_internal") => hook_noop as *mut c_void,
-        ("msvcr80.dll", "__RTDynamicCast") => hook_identity as *mut c_void,
-        ("msvcr80.dll", "_adjust_fdiv") => &raw mut ADJUST_FDIV as *mut c_void,
+        ("msvcr80.dll", "_adjust_fdiv") => (&raw mut ADJUST_FDIV).cast::<c_void>(),
 
         _ => {
-            eprintln!("[peldr] Warning: Unhandled import {}!{}", dll, func);
+            eprintln!("[peldr] Warning: Unhandled import {dll}!{func}");
             hook_noop as *mut c_void
         }
     }
@@ -763,19 +821,20 @@ static mut WIN32_TEB: [u32; 1024] = [0; 1024];
 static mut TEB_SELECTOR: u16 = 0;
 
 pub fn init_win32_teb() {
+    // SAFETY: Setting up thread-local storage segment selector (FS) for Win32 TEB on x86.
     unsafe {
         if TEB_SELECTOR != 0 {
             return;
         }
 
-        WIN32_TEB[0] = 0xFFFFFFFF; // Head of SEH chain
-        WIN32_TEB[6] = &raw const WIN32_TEB as u32; // Self pointer at TEB+0x18
-        WIN32_TEB[8] = libc::getpid() as u32; // Process ID at TEB+0x20
-        WIN32_TEB[9] = libc::pthread_self() as u32; // Thread ID at TEB+0x24
+        WIN32_TEB[0] = 0xFFFF_FFFF; // Head of SEH chain
+        WIN32_TEB[6] = u32::try_from((&raw const WIN32_TEB).addr()).unwrap(); // Self pointer at TEB+0x18
+        WIN32_TEB[8] = libc::getpid().cast_unsigned(); // Process ID at TEB+0x20
+        WIN32_TEB[9] = libc::pthread_self(); // Thread ID at TEB+0x24
 
         let mut desc = UserDesc {
-            entry_number: 0xFFFFFFFF,
-            base_addr: &raw const WIN32_TEB as u32,
+            entry_number: 0xFFFF_FFFF,
+            base_addr: u32::try_from((&raw const WIN32_TEB).addr()).unwrap(),
             limit: 4096,
             flags: 1 | (1 << 6), // 32-bit segment + useable
         };
@@ -783,14 +842,11 @@ pub fn init_win32_teb() {
         // Syscall 243 is SYS_set_thread_area on i386
         let res = libc::syscall(243, &mut desc);
         if res == 0 {
-            let sel = ((desc.entry_number << 3) | 3) as u16;
+            let sel = u16::try_from((desc.entry_number << 3) | 3).unwrap();
             TEB_SELECTOR = sel;
-            eprintln!(
-                "[peldr] Win32 TEB initialized successfully! Selector={:#x}",
-                sel
-            );
+            eprintln!("[peldr] Win32 TEB initialized successfully! Selector={sel:#x}");
         } else {
-            eprintln!("[peldr] Warning: SYS_set_thread_area returned {}", res);
+            eprintln!("[peldr] Warning: SYS_set_thread_area returned {res}");
         }
     }
 }
@@ -800,27 +856,35 @@ pub struct Win32ContextGuard {
 }
 
 impl Win32ContextGuard {
-    #[inline(always)]
+    /// Saves the current FS segment register and loads the Win32 TEB selector.
+    ///
+    /// # Safety
+    /// Must only be called on 32-bit x86 with a valid initialized Win32 TEB segment selector.
+    #[inline]
     pub unsafe fn enter() -> Self {
         let mut saved_fs: u16 = 0;
         let sel = TEB_SELECTOR;
         if sel != 0 {
-            std::arch::asm!(
-                "mov {saved:x}, fs",
-                "mov fs, {sel:x}",
-                saved = out(reg) saved_fs,
-                sel = in(reg) sel,
-                options(nostack, preserves_flags)
-            );
+            // SAFETY: Swapping FS segment register with Win32 TEB selector.
+            unsafe {
+                std::arch::asm!(
+                    "mov {saved:x}, fs",
+                    "mov fs, {sel:x}",
+                    saved = out(reg) saved_fs,
+                    sel = in(reg) sel,
+                    options(nostack, preserves_flags)
+                );
+            }
         }
         Self { saved_fs }
     }
 }
 
 impl Drop for Win32ContextGuard {
-    #[inline(always)]
+    #[inline]
     fn drop(&mut self) {
         if self.saved_fs != 0 {
+            // SAFETY: Restoring original host Linux FS segment register.
             unsafe {
                 std::arch::asm!(
                     "mov fs, {saved:x}",
@@ -836,7 +900,7 @@ impl Drop for Win32ContextGuard {
 #[no_mangle]
 pub static mut ADJUST_FDIV: i32 = 0;
 
-static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+static START_TIME: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
 // --- SETUPAPI Trampolines (Hardware Dongle Spoofing) ---
 
@@ -848,7 +912,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetClassDevsA(
     _flags: u32,
 ) -> *mut c_void {
     eprintln!("[hook_SetupDiGetClassDevsA]");
-    0x13370001 as *mut c_void
+    ptr::without_provenance_mut(0x1337_0001)
 }
 
 #[no_mangle]
@@ -859,16 +923,16 @@ pub unsafe extern "stdcall" fn hook_SetupDiEnumDeviceInterfaces(
     member_index: u32,
     device_interface_data: *mut c_void,
 ) -> i32 {
-    eprintln!(
-        "[hook_SetupDiEnumDeviceInterfaces] member_index={}",
-        member_index
-    );
+    eprintln!("[hook_SetupDiEnumDeviceInterfaces] member_index={member_index}");
     if member_index == 0 {
         if !device_interface_data.is_null() {
             // SP_DEVICE_INTERFACE_DATA: cbSize is at offset 0, Flags is at offset 20
-            let p = device_interface_data as *mut u32;
-            *p = 28; // sizeof(SP_DEVICE_INTERFACE_DATA)
-            *p.add(5) = 1; // SPINT_ACTIVE
+            let p = device_interface_data.cast::<u32>();
+            // SAFETY: Writing active interface header data into caller-supplied structure.
+            unsafe {
+                *p = 28; // sizeof(SP_DEVICE_INTERFACE_DATA)
+                *p.add(5) = 1; // SPINT_ACTIVE
+            }
         }
         1 // TRUE: Zoom hardware device found!
     } else {
@@ -877,6 +941,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiEnumDeviceInterfaces(
 }
 
 #[no_mangle]
+#[allow(clippy::cast_ptr_alignment)]
 pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
     _device_info_set: *mut c_void,
     _device_interface_data: *mut c_void,
@@ -887,22 +952,27 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
 ) -> i32 {
     const SPOOFED_PATH: &[u8] =
         b"\\\\?\\usb#vid_1686&pid_0047#c51t#{a5dcbf10-11d2-6530-c000-1f90ed51b94f}\0";
-    let needed = (4 + SPOOFED_PATH.len()) as u32;
+    let needed = u32::try_from(4 + SPOOFED_PATH.len()).unwrap_or(0);
 
     if !required_size.is_null() {
-        *required_size = needed;
+        // SAFETY: Writing required size to caller buffer.
+        unsafe {
+            *required_size = needed;
+        }
     }
 
     if !device_interface_detail_data.is_null() && device_interface_detail_data_size >= needed {
         // cbSize = 5 for SP_DEVICE_INTERFACE_DETAIL_DATA_A on 32-bit Windows
-        let p = device_interface_detail_data as *mut u8;
-        *(p as *mut u32) = 5;
-        ptr::copy_nonoverlapping(SPOOFED_PATH.as_ptr(), p.add(4), SPOOFED_PATH.len());
+        let p = device_interface_detail_data.cast::<u8>();
+        // SAFETY: Writing unaligned cbSize header and copying spoofed USB path.
+        unsafe {
+            ptr::write_unaligned(p.cast::<u32>(), 5);
+            ptr::copy_nonoverlapping(SPOOFED_PATH.as_ptr(), p.add(4), SPOOFED_PATH.len());
+        }
     }
 
     eprintln!(
-        "[hook_SetupDiGetDeviceInterfaceDetailA] size={}, needed={}",
-        device_interface_detail_data_size, needed
+        "[hook_SetupDiGetDeviceInterfaceDetailA] size={device_interface_detail_data_size}, needed={needed}"
     );
     1 // TRUE
 }
@@ -919,17 +989,26 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceRegistryPropertyA(
 ) -> i32 {
     const HARDWARE_ID: &[u8] = b"USB\\VID_1686&PID_0047\0\0";
     eprintln!(
-        "[hook_SetupDiGetDeviceRegistryPropertyA] prop={}, buf_size={}",
-        property, property_buffer_size
+        "[hook_SetupDiGetDeviceRegistryPropertyA] prop={property}, buf_size={property_buffer_size}"
     );
+    let id_len = u32::try_from(HARDWARE_ID.len()).unwrap_or(0);
     if !required_size.is_null() {
-        *required_size = HARDWARE_ID.len() as u32;
+        // SAFETY: Writing required hardware ID length.
+        unsafe {
+            *required_size = id_len;
+        }
     }
     if !property_reg_data_type.is_null() {
-        *property_reg_data_type = 1; // REG_SZ
+        // SAFETY: Setting registry type to REG_SZ (1).
+        unsafe {
+            *property_reg_data_type = 1;
+        }
     }
-    if !property_buffer.is_null() && property_buffer_size >= HARDWARE_ID.len() as u32 {
-        ptr::copy_nonoverlapping(HARDWARE_ID.as_ptr(), property_buffer, HARDWARE_ID.len());
+    if !property_buffer.is_null() && property_buffer_size >= id_len {
+        // SAFETY: Copying hardware ID string into caller buffer.
+        unsafe {
+            ptr::copy_nonoverlapping(HARDWARE_ID.as_ptr(), property_buffer, HARDWARE_ID.len());
+        }
     }
     1
 }
@@ -945,57 +1024,67 @@ pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(
 // --- KERNEL32 Trampolines ---
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_InitializeCriticalSection(cs: *mut c_void) {
+pub const unsafe extern "stdcall" fn hook_InitializeCriticalSection(cs: *mut c_void) {
     if !cs.is_null() {
-        ptr::write_bytes(cs as *mut u8, 0, 24);
+        // SAFETY: Zeroing 24-byte Win32 CRITICAL_SECTION structure.
+        unsafe {
+            ptr::write_bytes(cs.cast::<u8>(), 0, 24);
+        }
     }
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_DeleteCriticalSection(_cs: *mut c_void) {}
+pub const unsafe extern "stdcall" fn hook_DeleteCriticalSection(_cs: *mut c_void) {}
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_EnterCriticalSection(_cs: *mut c_void) {}
+pub const unsafe extern "stdcall" fn hook_EnterCriticalSection(_cs: *mut c_void) {}
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_LeaveCriticalSection(_cs: *mut c_void) {}
+pub const unsafe extern "stdcall" fn hook_LeaveCriticalSection(_cs: *mut c_void) {}
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_GetCurrentProcess() -> *mut c_void {
-    -1isize as *mut c_void
+pub const unsafe extern "stdcall" fn hook_GetCurrentProcess() -> *mut c_void {
+    ptr::without_provenance_mut(usize::MAX)
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetCurrentProcessId() -> u32 {
-    libc::getpid() as u32
+    libc::getpid().cast_unsigned()
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetCurrentThreadId() -> u32 {
-    libc::pthread_self() as u32
+    libc::pthread_self()
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_GetLastError() -> u32 {
+pub const unsafe extern "stdcall" fn hook_GetLastError() -> u32 {
     0
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetTickCount() -> u32 {
-    START_TIME.elapsed().as_millis() as u32
+    u32::try_from(START_TIME.elapsed().as_millis() & 0xFFFF_FFFF).unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetSystemTimeAsFileTime(ft: *mut u64) {
     if !ft.is_null() {
-        *ft = 130000000000000000;
+        // SAFETY: Writing constant mock file time.
+        unsafe {
+            *ft = 130_000_000_000_000_000;
+        }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_QueryPerformanceCounter(pc: *mut i64) -> i32 {
     if !pc.is_null() {
-        *pc = START_TIME.elapsed().as_nanos() as i64;
+        // SAFETY: Writing high-resolution timestamp to caller pointer.
+        unsafe {
+            *pc =
+                i64::try_from(START_TIME.elapsed().as_nanos() & 0x7FFF_FFFF_FFFF_FFFF).unwrap_or(0);
+        }
     }
     1
 }
@@ -1009,7 +1098,8 @@ pub unsafe extern "stdcall" fn hook_InterlockedCompareExchange(
     if dest.is_null() {
         return 0;
     }
-    let atomic = &*(dest as *const AtomicI32);
+    // SAFETY: Interlocked atomic operation on 32-bit aligned pointer.
+    let atomic = unsafe { &*dest.cast::<AtomicI32>() };
     atomic
         .compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
         .unwrap_or_else(|v| v)
@@ -1020,32 +1110,35 @@ pub unsafe extern "stdcall" fn hook_InterlockedExchange(target: *mut i32, val: i
     if target.is_null() {
         return 0;
     }
-    let atomic = &*(target as *const AtomicI32);
+    // SAFETY: Interlocked atomic swap on 32-bit aligned pointer.
+    let atomic = unsafe { &*target.cast::<AtomicI32>() };
     atomic.swap(val, Ordering::SeqCst)
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_IsDebuggerPresent() -> i32 {
+pub const unsafe extern "stdcall" fn hook_IsDebuggerPresent() -> i32 {
     0
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_Sleep(ms: u32) {
-    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_SetUnhandledExceptionFilter(_f: *mut c_void) -> *mut c_void {
+pub const unsafe extern "stdcall" fn hook_SetUnhandledExceptionFilter(
+    _f: *mut c_void,
+) -> *mut c_void {
     ptr::null_mut()
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_UnhandledExceptionFilter(_p: *mut c_void) -> i32 {
+pub const unsafe extern "stdcall" fn hook_UnhandledExceptionFilter(_p: *mut c_void) -> i32 {
     0
 }
 
 #[no_mangle]
-pub unsafe extern "stdcall" fn hook_TerminateProcess(_h: *mut c_void, _code: u32) -> i32 {
+pub const unsafe extern "stdcall" fn hook_TerminateProcess(_h: *mut c_void, _code: u32) -> i32 {
     1
 }
 
@@ -1054,7 +1147,7 @@ pub unsafe extern "stdcall" fn hook_TerminateProcess(_h: *mut c_void, _code: u32
 #[no_mangle]
 pub unsafe extern "C" fn hook_malloc(size: usize) -> *mut c_void {
     let p = libc::malloc(size);
-    eprintln!("[hook_malloc] size={} -> {:?}", size, p);
+    eprintln!("[hook_malloc] size={size} -> {p:?}");
     p
 }
 
@@ -1319,45 +1412,47 @@ pub unsafe extern "C" fn hook_tan() {
 
 #[no_mangle]
 pub unsafe extern "C" fn hook_initterm(
-    start: *const extern "C" fn(),
-    end: *const extern "C" fn(),
+    start: *const Option<extern "C" fn()>,
+    end: *const Option<extern "C" fn()>,
 ) -> i32 {
     let mut cur = start;
     while cur < end {
-        let f = *cur;
-        if (f as usize) != 0 {
-            f();
+        // SAFETY: Reading function pointer from valid CRT init table.
+        let f = unsafe { *cur };
+        if let Some(func) = f {
+            func();
         }
-        cur = cur.add(1);
+        // SAFETY: Incrementing pointer within table bounds.
+        cur = unsafe { cur.add(1) };
     }
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_identity(p: *mut c_void) -> *mut c_void {
+pub const unsafe extern "C" fn hook_identity(p: *mut c_void) -> *mut c_void {
     p
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_null() -> *mut c_void {
+pub const unsafe extern "C" fn hook_null() -> *mut c_void {
     ptr::null_mut()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_noop() {}
+pub const unsafe extern "C" fn hook_noop() {}
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_zero() -> i32 {
+pub const unsafe extern "C" fn hook_zero() -> i32 {
     0
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_onexit(p: *mut c_void) -> *mut c_void {
+pub const unsafe extern "C" fn hook_onexit(p: *mut c_void) -> *mut c_void {
     p
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hook_dllonexit(
+pub const unsafe extern "C" fn hook_dllonexit(
     p: *mut c_void,
     _a: *mut c_void,
     _b: *mut c_void,

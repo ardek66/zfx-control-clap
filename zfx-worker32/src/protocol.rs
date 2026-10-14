@@ -2,7 +2,7 @@
 
 use std::sync::atomic::AtomicU32;
 
-pub const BRIDGE_MAGIC: u32 = 0x5A465842; // 'ZFXB'
+pub const BRIDGE_MAGIC: u32 = 0x5A46_5842; // 'ZFXB'
 pub const MAX_FRAMES: usize = 4096;
 pub const MAX_PARAMS: usize = 128;
 pub const MAX_PARAM_QUEUE: usize = 64;
@@ -63,7 +63,7 @@ pub struct ZfxSharedBridge {
     pub time_sig_denom: u16,
     pub is_playing: u8,
     pub has_tempo: u8,
-    pub _pad: [u8; 2],
+    pub pad: [u8; 2],
 
     // Plugin introspection from worker
     pub num_params: u32,
@@ -105,7 +105,7 @@ impl ZfxSharedBridge {
         self.time_sig_denom = 4;
         self.is_playing = 0;
         self.has_tempo = 1;
-        self._pad = [0; 2];
+        self.pad = [0; 2];
         self.num_params = 0;
         self.num_inputs = 2;
         self.num_outputs = 2;
@@ -114,16 +114,21 @@ impl ZfxSharedBridge {
     }
 }
 
+/// # Safety
+/// `val_addr` must point to an initialized `AtomicU32` in valid shared memory.
 #[inline]
 pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: Option<u64>) {
-    let ts = timeout_us.map(|us| libc::timespec {
-        tv_sec: (us / 1_000_000) as libc::time_t,
-        tv_nsec: ((us % 1_000_000) * 1_000) as libc::c_long,
+    let ts = timeout_us.and_then(|us| {
+        let sec = libc::time_t::try_from(us / 1_000_000).ok()?;
+        let nsec = libc::c_long::try_from((us % 1_000_000) * 1_000).ok()?;
+        Some(libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        })
     });
-    let ts_ptr = match &ts {
-        Some(t) => t as *const libc::timespec,
-        None => std::ptr::null(),
-    };
+    let ts_ptr = ts
+        .as_ref()
+        .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>);
     libc::syscall(
         libc::SYS_futex,
         val_addr,
@@ -135,13 +140,15 @@ pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: 
     );
 }
 
+/// # Safety
+/// `val_addr` must point to an initialized `AtomicU32` in valid shared memory.
 #[inline]
 pub unsafe fn futex_wake(val_addr: *const AtomicU32) {
     libc::syscall(
         libc::SYS_futex,
         val_addr,
         libc::FUTEX_WAKE,
-        1, // wake 1 waiter
+        1,
         std::ptr::null::<libc::timespec>(),
         std::ptr::null::<u32>(),
         0,

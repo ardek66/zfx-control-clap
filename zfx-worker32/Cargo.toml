@@ -14,3 +14,64 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[lints]
+workspace = true
+
+[workspace]
+
+[workspace.lints.clippy]
+# Baseline hygiene: Elevate pedantic and nursery suites to warn for baseline modern Rust idioms
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Loop Habits: Deny C-style index loops, raw pointer iteration, and manual buffer copying
+needless_range_loop = "deny"
+manual_memcpy = "deny"
+explicit_iter_loop = "deny"
+explicit_into_iter_loop = "deny"
+while_let_on_iterator = "deny"
+iter_next_loop = "deny"
+never_loop = "deny"
+manual_find = "warn"
+manual_filter_map = "warn"
+manual_flatten = "warn"
+
+# Pointer & Cast Clutter: Hunt down raw pointer math, C-style `as` coercion, and truncating casts
+as_conversions = "deny"
+cast_lossless = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+cast_ptr_alignment = "deny"
+ptr_as_ptr = "deny"
+ptr_offset_with_cast = "deny"
+transmute_ptr_to_ptr = "deny"
+transmutes_expressible_as_ptr_casts = "deny"
+fn_to_numeric_cast = "deny"
+fn_to_numeric_cast_with_truncation = "deny"
+char_lit_as_u8 = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# Memory & Copy Overhead: Prevent C++ pass-by-value semantics, redundant clones, and pseudo-memcpy copies
+redundant_clone = "deny"
+clone_on_copy = "deny"
+clone_on_ref_ptr = "deny"
+cloned_instead_of_copied = "deny"
+unnecessary_to_owned = "deny"
+needless_pass_by_value = "deny"
+large_types_passed_by_value = "deny"
+trivially_copy_pass_by_ref = "deny"
+
+# Logical Complexity: Flatten nested if/else ladders, eliminate manual range checks, and limit function sprawl
+cognitive_complexity = "deny"
+collapsible_if = "deny"
+collapsible_else_if = "deny"
+manual_range_contains = "deny"
+match_same_arms = "deny"
+match_bool = "deny"
+needless_bool = "deny"
+too_many_arguments = "deny"
+too_many_lines = "warn"
+
