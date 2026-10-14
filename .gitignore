@@ -1,0 +1,13 @@
+/target/
+**/target/
+/wine_prefix/
+/clap_dist/
+/clap-validator/
+/E_ZFX_Win/
+/E_ZFX_Win.zip
+/ghidra_proj/
+__pycache__/
+*.pyc
+/test
+/test2
+*.log

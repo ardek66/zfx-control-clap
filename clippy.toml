@@ -1,0 +1,20 @@
+# Cognitive Complexity: Severely constrain nested decision paths (default is 25)
+cognitive-complexity-threshold = 15
+
+# Monolith Breaker: Flag decompiled massive functions exceeding sane line counts (default is 100)
+too-many-lines-threshold = 80
+
+# Parameter Packing: Restrict C-style long parameter lists in favor of domain structs (default is 7)
+too-many-arguments-threshold = 5
+
+# Memory Optimization: Enforce pass-by-reference on stack allocations exceeding two 64-bit words (in bytes)
+pass-by-value-size-limit = 128
+
+# Type Sanity: Prevent deeply nested decompiled type signatures and excessive tuple indirection
+type-complexity-threshold = 150
+
+# State Machine Habits: Catch C-style structs loaded with multiple boolean flags instead of enums
+max-struct-bools = 3
+
+# Decompiler Cleanup: Limit clusters of single-letter loop counters and indices (i, j, k, p, etc.)
+single-char-binding-names-threshold = 4
