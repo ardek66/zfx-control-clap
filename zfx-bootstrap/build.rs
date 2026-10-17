@@ -28,12 +28,13 @@ fn collect_assets(dir: &Path, prefix: &str, assets: &mut Vec<(String, String)>) 
             let Some(rel) = path.strip_prefix(dir).ok() else {
                 continue;
             };
-            let rel_path = rel.to_string_lossy().to_string();
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
             let key = if prefix.is_empty() {
                 rel_path
             } else {
                 format!("{prefix}/{rel_path}")
             };
+            let key = key.replace('\\', "/");
             assets.push((key, path.to_string_lossy().to_string()));
         } else if path.is_dir() {
             let sub_name = path
@@ -50,19 +51,17 @@ fn collect_assets(dir: &Path, prefix: &str, assets: &mut Vec<(String, String)>) 
 }
 
 fn find_case_insensitive_dir(parent: &Path, target: &str) -> Option<PathBuf> {
-    if let Ok(entries) = fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                if let Some(name) = p.file_name() {
-                    if name.to_string_lossy().eq_ignore_ascii_case(target) {
-                        return Some(p);
-                    }
-                }
-            }
+    fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
+        let p = entry.path();
+        if p.is_dir()
+            && p.file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(target))
+        {
+            Some(p)
+        } else {
+            None
         }
-    }
-    None
+    })
 }
 
 fn resolve_dll_path(manifest_dir: &Path, plugin_name: &str) -> String {
@@ -121,33 +120,36 @@ fn resolve_xml_path(manifest_dir: &Path, plugin_name: &str) -> String {
     })
 }
 
-fn build_asset_map(manifest_dir: &Path, plugin_name: &str) -> HashMap<String, String> {
-    let mut asset_map = HashMap::new();
-    let mut common_assets = Vec::new();
-    for sub in &["AmpMdl", "Bkgd", "EffMdl", "outMaster", "outTuner"] {
-        let sub_dir = manifest_dir.join("assets").join(sub);
-        if sub_dir.exists() {
-            collect_assets(&sub_dir, sub, &mut common_assets);
-            collect_assets(&sub_dir, "", &mut common_assets);
-        }
-    }
-    for (k, v) in common_assets {
-        let lower = k.to_lowercase();
-        asset_map.insert(k.clone(), v.clone());
-        if lower != k {
-            asset_map.insert(lower.clone(), v.clone());
+fn capitalize_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |f| {
+        let mut res = f.to_ascii_uppercase().to_string();
+        res.push_str(chars.as_str());
+        res
+    })
+}
+
+fn insert_asset_variants(asset_map: &mut HashMap<String, String>, key: &str, value: &str) {
+    let lower = key.to_lowercase();
+    let cap = capitalize_ascii(key);
+    for k in &[key.to_string(), lower, cap] {
+        asset_map.insert(k.clone(), value.to_string());
+        if k.contains('/') {
+            asset_map.insert(k.replace('/', ":"), value.to_string());
         }
         if let Some(stem) = k.strip_suffix(".png").or_else(|| k.strip_suffix(".jpg")) {
-            asset_map.insert(stem.to_string(), v.clone());
-        }
-        if let Some(stem) = lower
-            .strip_suffix(".png")
-            .or_else(|| lower.strip_suffix(".jpg"))
-        {
-            asset_map.insert(stem.to_string(), v.clone());
+            asset_map.insert(stem.to_string(), value.to_string());
+            let stem_cap = capitalize_ascii(stem);
+            asset_map.insert(stem_cap.clone(), value.to_string());
+            if stem.contains('/') {
+                asset_map.insert(stem.replace('/', ":"), value.to_string());
+                asset_map.insert(stem_cap.replace('/', ":"), value.to_string());
+            }
         }
     }
+}
 
+fn build_asset_map(manifest_dir: &Path, plugin_name: &str) -> HashMap<String, String> {
     let assets_root = manifest_dir.join("assets");
     let plugin_dir = {
         let direct = assets_root.join(plugin_name);
@@ -158,30 +160,54 @@ fn build_asset_map(manifest_dir: &Path, plugin_name: &str) -> HashMap<String, St
         }
     };
 
-    if let Some(pdir) = plugin_dir {
+    let mut plugin_assets = Vec::new();
+    let mut plugin_local_lowers = std::collections::HashSet::new();
+    if let Some(pdir) = &plugin_dir {
         let pdir_name = pdir
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().to_string());
-        let mut plugin_assets = Vec::new();
-        collect_assets(&pdir, &pdir_name, &mut plugin_assets);
-        collect_assets(&pdir, plugin_name, &mut plugin_assets);
-        collect_assets(&pdir, "", &mut plugin_assets);
-        for (k, v) in plugin_assets {
-            let lower = k.to_lowercase();
-            asset_map.insert(k.clone(), v.clone());
-            if lower != k {
-                asset_map.insert(lower.clone(), v.clone());
-            }
+        collect_assets(pdir, &pdir_name, &mut plugin_assets);
+        collect_assets(pdir, plugin_name, &mut plugin_assets);
+        let mut local_only = Vec::new();
+        collect_assets(pdir, "", &mut local_only);
+        for (k, _) in &local_only {
+            plugin_local_lowers.insert(k.to_lowercase());
             if let Some(stem) = k.strip_suffix(".png").or_else(|| k.strip_suffix(".jpg")) {
-                asset_map.insert(stem.to_string(), v.clone());
-            }
-            if let Some(stem) = lower
-                .strip_suffix(".png")
-                .or_else(|| lower.strip_suffix(".jpg"))
-            {
-                asset_map.insert(stem.to_string(), v.clone());
+                plugin_local_lowers.insert(stem.to_lowercase());
             }
         }
+        plugin_assets.extend(local_only);
+    }
+
+    let mut asset_map = HashMap::new();
+    let mut common_assets = Vec::new();
+    let common_dir = manifest_dir.join("assets").join("Common");
+    if common_dir.exists() {
+        collect_assets(&common_dir, "Common", &mut common_assets);
+        let mut common_root = Vec::new();
+        collect_assets(&common_dir, "", &mut common_root);
+        // Do not let generic Common assets in root namespace shadow plugin-local assets (case-insensitively)
+        for (k, v) in common_root {
+            let lower_k = k.to_lowercase();
+            let stem_lower = k
+                .strip_suffix(".png")
+                .or_else(|| k.strip_suffix(".jpg"))
+                .map(str::to_lowercase);
+            let is_shadowed = plugin_local_lowers.contains(&lower_k)
+                || stem_lower
+                    .as_ref()
+                    .is_some_and(|s| plugin_local_lowers.contains(s));
+            if !is_shadowed {
+                common_assets.push((k, v));
+            }
+        }
+    }
+    for (k, v) in &common_assets {
+        insert_asset_variants(&mut asset_map, k, v);
+    }
+
+    for (k, v) in &plugin_assets {
+        insert_asset_variants(&mut asset_map, k, v);
     }
     asset_map
 }
@@ -200,6 +226,7 @@ fn generate_asset_code(manifest_dir: &Path, plugin_name: &str) -> String {
     sorted_paths.sort_by(|a, b| a.0.cmp(&b.0));
     for (abs_path_str, mut keys) in sorted_paths {
         keys.sort();
+        keys.dedup();
         let safe_path = abs_path_str.replace('\\', "\\\\");
         let pattern = keys
             .iter()
@@ -253,11 +280,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
 
     if let Ok(ld_lib_path) = env::var("LD_LIBRARY_PATH") {
-        for path in ld_lib_path.split(':') {
-            if !path.is_empty() && Path::new(path).exists() {
-                println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
-            }
-        }
+        ld_lib_path
+            .split(':')
+            .filter(|p| !p.is_empty() && Path::new(p).exists())
+            .for_each(|path| println!("cargo:rustc-link-arg=-Wl,-rpath,{path}"));
     }
 
     let out_dir = env::var("OUT_DIR").unwrap();

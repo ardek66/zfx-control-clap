@@ -4,6 +4,53 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
+use crate::analog_proto;
+use crate::dsp_layout::{BiquadCoeffs, MemoryView, Order5Coeffs};
+
+use std::sync::atomic::AtomicUsize;
+
+const MAX_TRACKED_ALLOCS: usize = 1024;
+static TRACKED_ALLOCS: [AtomicUsize; MAX_TRACKED_ALLOCS] =
+    [const { AtomicUsize::new(0) }; MAX_TRACKED_ALLOCS];
+
+#[inline]
+pub fn is_plausible_heap_buf(ptr: usize) -> bool {
+    if ptr == 0 {
+        return false;
+    }
+    TRACKED_ALLOCS
+        .iter()
+        .any(|p| p.load(Ordering::Relaxed) == ptr)
+}
+
+#[repr(C)]
+struct HpsPitchHelper {
+    vtable: *const *const c_void,
+    active: i32,
+    pitch_index: i32,
+}
+
+const unsafe extern "stdcall" fn hps_pitch_calc(_pitch: f32) {
+    // Pitch calculation callback for Harmonized Pitch Shifter
+}
+
+struct SyncPtrTable([*const c_void; 4]);
+// SAFETY: SyncPtrTable wraps an immutable table of static function pointers and null entries.
+unsafe impl Sync for SyncPtrTable {}
+
+#[allow(clippy::as_conversions)]
+static HPS_VTABLE: SyncPtrTable = SyncPtrTable([
+    std::ptr::null(),
+    hps_pitch_calc as *const c_void,
+    std::ptr::null(),
+    std::ptr::null(),
+]);
+static mut HPS_HELPER: HpsPitchHelper = HpsPitchHelper {
+    vtable: HPS_VTABLE.0.as_ptr(),
+    active: 1,
+    pitch_index: 0,
+};
+
 /// Represents our embedded, memory-mapped Windows DLL.
 pub struct PeModule {
     pub base_addr: *mut c_void,
@@ -31,21 +78,44 @@ impl PeModule {
         }
 
         // 1. Allocate executable memory for the full image
-        // SAFETY: Allocating private anonymous page-aligned memory for the PE image.
-        let base_addr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size_of_image,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
+        #[cfg(target_os = "linux")]
+        let base_addr = {
+            // SAFETY: Allocating private anonymous page-aligned memory for the PE image.
+            let addr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    size_of_image,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if addr == libc::MAP_FAILED {
+                return Err("Failed to allocate executable memory via mmap");
+            }
+            addr
         };
 
-        if base_addr == libc::MAP_FAILED {
-            return Err("Failed to allocate executable memory via mmap");
-        }
+        #[cfg(target_os = "windows")]
+        let base_addr = {
+            use windows_sys::Win32::System::Memory::{
+                VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+            };
+            // SAFETY: Allocating executable memory for the PE image on Windows.
+            let addr = unsafe {
+                VirtualAlloc(
+                    ptr::null_mut(),
+                    size_of_image,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE,
+                )
+            };
+            if addr.is_null() {
+                return Err("Failed to allocate executable memory via VirtualAlloc");
+            }
+            addr
+        };
 
         let base_ptr = base_addr.cast::<u8>();
 
@@ -115,6 +185,32 @@ impl PeModule {
         if let Some(pos) = mem_slice.windows(sig.len()).position(|w| w == sig) {
             mem_slice[pos..pos + patch.len()].copy_from_slice(&patch);
             eprintln!("[peldr] Hardware dongle check bypassed at RVA {pos:#x}");
+        }
+
+        // 7. Bypass redundant O(N^2) inner-loop envelope recalculation in Pedal_Pitch
+        // In Pedal_Pitch, when rocking the pedal, 0x10002010 updates the pitch ratio in real time.
+        // Immediately following at 0x10003234, Zoom's legacy code calls `edx` (0x100051f0) which
+        // re-runs a loop over (sample_frames - i) samples on EVERY sample, causing O(N^2) CPU explosion
+        // at 96k/192k (524k to 2M iterations/block).
+        // By replacing `mov eax, [ebx + 0xf4]` at 0x10003234 with `jmp 0x10003299; nop`,
+        // `call 0x10002010` runs live on every sample the pedal moves, but the O(N^2) table recalculation
+        // is bypassed, restoring smooth real-time pedal tracking at 0% CPU overhead.
+        // Signature at 0x10003228: mov esi, ebx; movss [esp], xmm0; call 0x10002010; mov eax, [ebx + 0xf4]
+        let pitch_pedal_sig = [
+            0x8bu8, 0xf3, 0xf3, 0x0f, 0x11, 0x04, 0x24, 0xe8, 0xdc, 0xed, 0xff, 0xff, 0x8b, 0x83,
+            0xf4, 0x00, 0x00, 0x00,
+        ];
+        let pitch_pedal_patch = [0xe9u8, 0x60, 0x00, 0x00, 0x00, 0x90];
+        if let Some(pos) = mem_slice
+            .windows(pitch_pedal_sig.len())
+            .position(|w| w == pitch_pedal_sig)
+        {
+            mem_slice[pos + 12..pos + 12 + pitch_pedal_patch.len()]
+                .copy_from_slice(&pitch_pedal_patch);
+            eprintln!(
+                "[peldr] Pedal_Pitch O(N^2) loop hot-patched at RVA {:#x} (live pitch tracking preserved)",
+                pos + 12
+            );
         }
 
         Ok(Self {
@@ -278,7 +374,7 @@ impl PeModule {
             let ords_rva =
                 usize::try_from(ptr::read_unaligned(exp_ptr.add(36).cast::<u32>())).unwrap();
 
-            for i in 0..num_names {
+            (0..num_names).find_map(|i| {
                 let n_rva = usize::try_from(ptr::read_unaligned(
                     base_ptr.add(names_rva + i * 4).cast::<u32>(),
                 ))
@@ -297,9 +393,9 @@ impl PeModule {
                         return Some(base_ptr.add(fn_rva).cast::<c_void>());
                     }
                 }
-            }
+                None
+            })
         }
-        None
     }
 
     /// Resolves the `ZTypeIF` export
@@ -355,12 +451,382 @@ impl PeModule {
             return Err("AEffect magic does not match 'VstP'");
         }
 
+        // SAFETY: Reading object pointer from valid AEffect instance.
+        let obj = unsafe { (*effect).object.cast::<*mut usize>() };
+        if !obj.is_null() {
+            let obj_u8 = obj.cast::<u8>();
+            // SAFETY: Checking if [obj + 0x328] is null and this is an HPS effect instance.
+            unsafe {
+                #[allow(clippy::cast_ptr_alignment)]
+                let p_sub = obj_u8.add(0x328).cast::<*mut HpsPitchHelper>();
+                if (*p_sub).is_null() {
+                    let pe_bytes =
+                        std::slice::from_raw_parts(self.base_addr.cast::<u8>(), self.size);
+                    if pe_bytes
+                        .windows(6)
+                        .any(|w| w == [0x8b, 0x93, 0x28, 0x03, 0x00, 0x00])
+                    {
+                        eprintln!("[peldr] Installed HpsPitchHelper at [obj + 0x328]");
+                        *p_sub = &raw mut HPS_HELPER;
+                    }
+                }
+            }
+        }
+
+        let filter_adapter = self.scan_filter_adapter(effect);
+
         Ok(ZfxDspInstance {
             iface_wrapper: instance,
             effect,
+            filter_adapter,
         })
     }
+
+    /// Automatically scans mapped PE section memory and DSP object layout to construct the universal filter adapter.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::cognitive_complexity
+    )]
+    pub fn scan_filter_adapter(&self, effect: *mut AEffect) -> FilterAdapter {
+        let mut adapter = FilterAdapter {
+            biquad_offsets: [0; 8],
+            num_biquads: 0,
+            sr_f64_offset: None,
+            sr_i32_offset: None,
+            comb_len_offset: None,
+            comb_buf_offset: None,
+            comb_len_base: None,
+            legacy_wah_ptr: None,
+            legacy_wah_base: 0.0,
+            legacy_pitch_ptrs: None,
+            order5_offset: None,
+            order5_base_a: [0.0; 5],
+            order5_base_b: [0.0; 6],
+            wah_offset: None,
+            wah_base_multiplier: 0.0,
+            comb_gain_base: None,
+        };
+
+        // SAFETY: Slicing the mapped PE image memory to locate sample rate branching opcodes.
+        let mem = unsafe { std::slice::from_raw_parts(self.base_addr.cast::<u8>(), self.size) };
+        let base = self.base_addr as usize;
+        let end = base.saturating_add(self.size);
+
+        // 1. Check for WahMultiplier pattern: cmp esi, 0xbb80 (\x81\xfe\x80\xbb\x00\x00)
+        let wah_sig = [0x81u8, 0xfe, 0x80, 0xbb, 0x00, 0x00];
+        if let Some(pos) = mem.windows(wah_sig.len()).position(|w| w == wah_sig) {
+            let chunk = &mem[pos..pos.saturating_add(60).min(mem.len())];
+            if let Some(je_rel) = chunk.windows(2).position(|w| w[0] == 0x74) {
+                let fb_sub = &chunk[je_rel + 2..];
+                if fb_sub.len() >= 8 && fb_sub[..4] == [0xf2, 0x0f, 0x10, 0x05] {
+                    let fb_addr =
+                        usize::try_from(u32::from_le_bytes(fb_sub[4..8].try_into().unwrap()))
+                            .unwrap_or(0);
+                    if let Some(jmp_rel) = fb_sub.windows(2).position(|w| w[0] == 0xeb) {
+                        let k48_sub = &fb_sub[jmp_rel + 2..];
+                        if k48_sub.len() >= 8 && k48_sub[..4] == [0xf2, 0x0f, 0x10, 0x05] {
+                            let k48_addr = usize::try_from(u32::from_le_bytes(
+                                k48_sub[4..8].try_into().unwrap(),
+                            ))
+                            .unwrap_or(0);
+                            if fb_addr >= base
+                                && fb_addr + 8 <= end
+                                && k48_addr >= base
+                                && k48_addr + 8 <= end
+                            {
+                                let fb_ptr = fb_addr as *mut f64;
+                                let k48_ptr = k48_addr as *const f64;
+                                // SAFETY: fb_ptr and k48_ptr verified within mapped PE module bounds.
+                                let base_48k_val = unsafe { *k48_ptr };
+                                eprintln!(
+                                    "[peldr] Detected WahMultiplier: fallback={fb_ptr:?}, k48={k48_ptr:?}, base={base_48k_val}"
+                                );
+                                adapter.legacy_wah_ptr = Some(fb_ptr);
+                                adapter.legacy_wah_base = base_48k_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check for cmp eax, 0xbb80 (\x3d\x80\xbb\x00\x00) for PitchPoles
+        let eax_sig = [0x3du8, 0x80, 0xbb, 0x00, 0x00];
+        if let Some(pos) = mem.windows(eax_sig.len()).position(|w| w == eax_sig) {
+            let chunk = &mem[pos..pos.saturating_add(300).min(mem.len())];
+            let mut je_pos = None;
+            let mut target_rel = 0usize;
+            let mut hdr_len = 0usize;
+
+            for (p, w) in chunk.windows(6).enumerate() {
+                if w[0] == 0x74 {
+                    je_pos = Some(p);
+                    target_rel = usize::from(w[1]);
+                    hdr_len = 2;
+                    break;
+                } else if w[0] == 0x0f && w[1] == 0x84 {
+                    je_pos = Some(p);
+                    target_rel = usize::try_from(u32::from_le_bytes(w[2..6].try_into().unwrap()))
+                        .unwrap_or(0);
+                    hdr_len = 6;
+                    break;
+                }
+            }
+
+            if let Some(jp) = je_pos {
+                let fb_start = jp + hdr_len;
+                let fb_end = (fb_start + target_rel).min(chunk.len());
+                let fb_block = &chunk[fb_start..fb_end];
+
+                let mut fb_ptrs = Vec::new();
+                for i in 0..fb_block.len().saturating_sub(7) {
+                    let w = &fb_block[i..i + 4];
+                    if w == [0xf2, 0x0f, 0x10, 0x05]
+                        || w == [0xf2, 0x0f, 0x10, 0x0d]
+                        || w == [0xf2, 0x0f, 0x10, 0x15]
+                    {
+                        let addr = usize::try_from(u32::from_le_bytes(
+                            fb_block[i + 4..i + 8].try_into().unwrap(),
+                        ))
+                        .unwrap_or(0);
+                        if addr >= base && addr + 8 <= end {
+                            fb_ptrs.push(addr as *mut f64);
+                        }
+                    }
+                }
+
+                let k48_start = fb_end;
+                let k48_end = (k48_start + fb_block.len() + 40).min(chunk.len());
+                let k48_block = &chunk[k48_start..k48_end];
+
+                let mut k48_ptrs = Vec::new();
+                for i in 0..k48_block.len().saturating_sub(7) {
+                    let w = &k48_block[i..i + 4];
+                    if w == [0xf2, 0x0f, 0x10, 0x05]
+                        || w == [0xf2, 0x0f, 0x10, 0x0d]
+                        || w == [0xf2, 0x0f, 0x10, 0x15]
+                    {
+                        let addr = usize::try_from(u32::from_le_bytes(
+                            k48_block[i + 4..i + 8].try_into().unwrap(),
+                        ))
+                        .unwrap_or(0);
+                        if addr >= base && addr + 8 <= end {
+                            k48_ptrs.push(addr as *const f64);
+                        }
+                    }
+                }
+
+                if fb_ptrs.len() == 2 && k48_ptrs.len() >= 2 {
+                    // SAFETY: k48_ptrs verified within mapped PE module bounds.
+                    let k48_val0 = unsafe { *k48_ptrs[0] };
+                    // SAFETY: k48_ptrs verified within mapped PE module bounds.
+                    let k48_val1 = unsafe { *k48_ptrs[1] };
+                    if ((0.70..0.85).contains(&k48_val0) && (0.90..0.99).contains(&k48_val1))
+                        || ((0.70..0.85).contains(&k48_val1) && (0.90..0.99).contains(&k48_val0))
+                    {
+                        let (fb_tr, fb_sp, base_tr, base_sp) = if (0.70..0.85).contains(&k48_val0) {
+                            (fb_ptrs[0], fb_ptrs[1], k48_val0, k48_val1)
+                        } else {
+                            (fb_ptrs[1], fb_ptrs[0], k48_val1, k48_val0)
+                        };
+                        eprintln!(
+                            "[peldr] Detected PitchPoles: tracking={fb_tr:?} (base={base_tr}), splicing={fb_sp:?} (base={base_sp})"
+                        );
+                        adapter.legacy_pitch_ptrs = Some((fb_tr, fb_sp, base_tr, base_sp));
+                    }
+                }
+            }
+        }
+
+        // 3. Object-level DSP structure inspection
+        // SAFETY: Effect object pointer is initialized by the plugin entrypoint.
+        let obj = unsafe { (*effect).object.cast::<*mut usize>() };
+        if !obj.is_null() {
+            // SAFETY: Reading vtable pointer from valid C++ object pointer.
+            let vtable = unsafe { *obj };
+            if !vtable.is_null() {
+                // SAFETY: Index 6 in vtable is setSampleRate virtual method.
+                let dsp_set_sr_fn = unsafe { *vtable.add(6) };
+                if dsp_set_sr_fn != 0 {
+                    // Initialize snapshots at 44.1k and 48k
+                    CURRENT_SAMPLE_RATE.store(44100, Ordering::Relaxed);
+                    // SAFETY: Invoking effOpen, effSetSampleRate, and setSampleRate virtual method at 44.1k under Win32ContextGuard.
+                    unsafe {
+                        let _guard = Win32ContextGuard::enter();
+                        ((*effect).dispatcher)(effect, 0, 0, 0, std::ptr::null_mut(), 0.0);
+                        ((*effect).dispatcher)(effect, 10, 0, 0, std::ptr::null_mut(), 44100.0);
+                        std::arch::asm!(
+                            "push {sr}",
+                            "call {set_sr}",
+                            sr = in(reg) 44100.0f32.to_bits(),
+                            set_sr = in(reg) dsp_set_sr_fn,
+                            in("ecx") obj,
+                            clobber_abi("C"),
+                        );
+                    }
+                    let mut snap_44k = [0u8; 0x300];
+                    // SAFETY: Reading 0x300 bytes of DSP object memory for 44.1k snapshot.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj.cast::<u8>(),
+                            snap_44k.as_mut_ptr(),
+                            0x300,
+                        );
+                    }
+
+                    CURRENT_SAMPLE_RATE.store(48000, Ordering::Relaxed);
+                    // SAFETY: Invoking effSetSampleRate and setSampleRate virtual method at 48k under Win32ContextGuard.
+                    unsafe {
+                        let _guard = Win32ContextGuard::enter();
+                        ((*effect).dispatcher)(effect, 10, 0, 0, std::ptr::null_mut(), 48000.0);
+                        std::arch::asm!(
+                            "push {sr}",
+                            "call {set_sr}",
+                            sr = in(reg) 48000.0f32.to_bits(),
+                            set_sr = in(reg) dsp_set_sr_fn,
+                            in("ecx") obj,
+                            clobber_abi("C"),
+                        );
+                    }
+                    let mut snap_48k = [0u8; 0x300];
+                    // SAFETY: Reading 0x300 bytes of DSP object memory for 48k snapshot.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj.cast::<u8>(),
+                            snap_48k.as_mut_ptr(),
+                            0x300,
+                        );
+                    }
+
+                    CURRENT_SAMPLE_RATE.store(96000, Ordering::Relaxed);
+                    // SAFETY: Invoking effSetSampleRate and setSampleRate virtual method at 96k under Win32ContextGuard.
+                    unsafe {
+                        let _guard = Win32ContextGuard::enter();
+                        ((*effect).dispatcher)(effect, 10, 0, 0, std::ptr::null_mut(), 96000.0);
+                        std::arch::asm!(
+                            "push {sr}",
+                            "call {set_sr}",
+                            sr = in(reg) 96000.0f32.to_bits(),
+                            set_sr = in(reg) dsp_set_sr_fn,
+                            in("ecx") obj,
+                            clobber_abi("C"),
+                        );
+                    }
+                    let mut snap_96k = [0u8; 0x300];
+                    // SAFETY: Reading 0x300 bytes of DSP object memory for 96k snapshot.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj.cast::<u8>(),
+                            snap_96k.as_mut_ptr(),
+                            0x300,
+                        );
+                    }
+
+                    // Restore back to 44.1k initial state
+                    CURRENT_SAMPLE_RATE.store(44100, Ordering::Relaxed);
+                    // SAFETY: Restoring 44.1k sample rate state via dispatcher and DSP vtable under Win32ContextGuard.
+                    unsafe {
+                        let _guard = Win32ContextGuard::enter();
+                        ((*effect).dispatcher)(effect, 10, 0, 0, std::ptr::null_mut(), 44100.0);
+                        std::arch::asm!(
+                            "push {sr}",
+                            "call {set_sr}",
+                            sr = in(reg) 44100.0f32.to_bits(),
+                            set_sr = in(reg) dsp_set_sr_fn,
+                            in("ecx") obj,
+                            clobber_abi("C"),
+                        );
+                    }
+
+                    let view_44 = MemoryView::new(&snap_44k);
+                    let view_48 = MemoryView::new(&snap_48k);
+                    let view_96 = MemoryView::new(&snap_96k);
+
+                    // Discover sample rate f64 offset
+                    if let Some(off) = view_48.find_sr_f64(&view_44) {
+                        eprintln!("[peldr] Discovered sr_f64_offset at {off:#x}");
+                        adapter.sr_f64_offset = Some(off);
+                    }
+
+                    // Discover sample rate i32 offset
+                    if let Some(off) = view_48.find_sr_i32(&view_44) {
+                        eprintln!("[peldr] Discovered sr_i32_offset at {off:#x}");
+                        adapter.sr_i32_offset = Some(off);
+                    }
+
+                    // Discover comb delay length offset and buffer pointer offset
+                    if let Some(comb) = view_48.find_comb_filter(
+                        &view_44,
+                        is_plausible_heap_buf,
+                        adapter.sr_f64_offset,
+                        adapter.sr_i32_offset,
+                    ) {
+                        eprintln!(
+                            "[peldr] Discovered comb_len_offset at {:#x} (48k={}, buf={:#x})",
+                            comb.len_offset, comb.base_len, comb.buf_offset
+                        );
+                        adapter.comb_len_offset = Some(comb.len_offset);
+                        adapter.comb_buf_offset = Some(comb.buf_offset);
+                        adapter.comb_len_base = Some(comb.base_len);
+                        adapter.comb_gain_base = comb.feedback_gain;
+                    }
+
+                    // Discover 5th-order cabinet / tone filter
+                    if let Some((off, coeffs)) = view_48.find_order5(&view_44, &view_96) {
+                        eprintln!(
+                            "[peldr] Discovered 5th-order filter at offset {off:#x} (A1={}, A5={}, B0={})",
+                            coeffs.a[0], coeffs.a[4], coeffs.b[0]
+                        );
+                        adapter.order5_offset = Some(off);
+                        adapter.order5_base_a = coeffs.a;
+                        adapter.order5_base_b = coeffs.b;
+                    }
+
+                    // Discover wah multiplier offset
+                    if let Some((off, v48)) = view_48.find_wah_multiplier(&view_44) {
+                        eprintln!(
+                            "[peldr] Discovered wah multiplier at offset {off:#x} (base_48k={v48})"
+                        );
+                        adapter.wah_offset = Some(off);
+                        adapter.wah_base_multiplier = v48;
+                    }
+                }
+            }
+        }
+
+        adapter
+    }
 }
+
+pub type LegacyPitchPoles = (*mut f64, *mut f64, f64, f64);
+
+/// Universal sample-rate adaptation descriptor for a DSP plugin instance.
+#[derive(Clone, Copy, Debug)]
+pub struct FilterAdapter {
+    pub biquad_offsets: [usize; 8],
+    pub num_biquads: usize,
+    pub sr_f64_offset: Option<usize>,
+    pub sr_i32_offset: Option<usize>,
+    pub comb_len_offset: Option<usize>,
+    pub comb_buf_offset: Option<usize>,
+    pub comb_len_base: Option<u32>,
+    pub legacy_wah_ptr: Option<*mut f64>,
+    pub legacy_wah_base: f64,
+    pub legacy_pitch_ptrs: Option<LegacyPitchPoles>,
+    pub order5_offset: Option<usize>,
+    pub order5_base_a: [f64; 5],
+    pub order5_base_b: [f64; 6],
+    pub wah_offset: Option<usize>,
+    pub wah_base_multiplier: f64,
+    pub comb_gain_base: Option<f64>,
+}
+
+// SAFETY: FilterAdapter pointers refer to mapped PE section memory that remains valid for the module lifetime.
+unsafe impl Send for FilterAdapter {}
+// SAFETY: FilterAdapter does not mutate memory concurrently across threads.
+unsafe impl Sync for FilterAdapter {}
 
 #[repr(C)]
 pub struct AEffect {
@@ -410,6 +876,7 @@ pub struct ZfxDspInstance {
     #[allow(dead_code)]
     pub iface_wrapper: *mut c_void,
     pub effect: *mut AEffect,
+    pub filter_adapter: FilterAdapter,
 }
 
 // SAFETY: ZfxDspInstance wraps raw VST 2.4 pointers which are thread-safe when synchronized by the host.
@@ -475,6 +942,30 @@ impl ZfxDspInstance {
         unsafe {
             let _guard = Win32ContextGuard::enter();
             ((*self.effect).set_parameter)(self.effect, index, value);
+        }
+
+        // Post-parameter hook: ensure sample rate fields remain set to current host rate
+        let current_sr = CURRENT_SAMPLE_RATE.load(Ordering::Relaxed);
+        if current_sr != 48000 && current_sr > 0 {
+            // SAFETY: obj verified non-null.
+            let obj_u8 = unsafe { (*self.effect).object.cast::<u8>() };
+            if !obj_u8.is_null() {
+                if let Some(off_f64) = self.filter_adapter.sr_f64_offset {
+                    // SAFETY: off_f64 verified within DSP object bounds.
+                    unsafe {
+                        std::ptr::write_unaligned(
+                            obj_u8.add(off_f64).cast::<f64>(),
+                            f64::from(current_sr),
+                        );
+                    }
+                }
+                if let Some(off_i32) = self.filter_adapter.sr_i32_offset {
+                    // SAFETY: off_i32 verified within DSP object bounds.
+                    unsafe {
+                        std::ptr::write_unaligned(obj_u8.add(off_i32).cast::<i32>(), current_sr);
+                    }
+                }
+            }
         }
     }
 
@@ -551,7 +1042,7 @@ impl ZfxDspInstance {
         for (ch, out_buf) in outputs.iter_mut().enumerate() {
             let src_ch = if ch < dsp_outs { ch } else { 0 };
             if src_ch < out_f64.len() {
-                for (s_out, &s_in) in out_buf.iter_mut().zip(out_f64[src_ch].iter()) {
+                for (s_out, &s_in) in out_buf.iter_mut().zip(&out_f64[src_ch]) {
                     #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
                     let s_f32 = s_in as f32;
                     *s_out = if s_in.is_finite() {
@@ -578,21 +1069,298 @@ impl ZfxDspInstance {
         }
     }
 
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        clippy::cast_ptr_alignment
+    )]
     pub fn set_sample_rate(&self, sample_rate: f32) {
-        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        eprintln!("[peldr] set_sample_rate called with {sample_rate}");
         let sr_i32 = sample_rate as i32;
         CURRENT_SAMPLE_RATE.store(sr_i32, Ordering::Relaxed);
-        // SAFETY: Invoking VST 2.4 effSetSampleRate dispatcher opcode under Win32ContextGuard.
+
+        // 1. Universal legacy migration: WahMultiplier & PitchPoles
+        if let Some(fb_ptr) = self.filter_adapter.legacy_wah_ptr {
+            let fs = f64::from(sample_rate);
+            let k48 = self.filter_adapter.legacy_wah_base;
+            let omega_a = 2.0 * 48000.0 * (k48 * 0.5).tan();
+            let k_target = 2.0 * (omega_a / (2.0 * fs)).atan();
+            // SAFETY: fb_ptr verified within mapped PE module bounds.
+            unsafe {
+                *fb_ptr = k_target;
+            }
+        }
+
+        if let Some((fb_tr, fb_sp, base_tr, base_sp)) = self.filter_adapter.legacy_pitch_ptrs {
+            let fs = f64::from(sample_rate);
+            let target_tr = analog_proto::transform_single_pole(base_tr, 48000.0, fs);
+            let target_sp = analog_proto::transform_single_pole(base_sp, 48000.0, fs);
+            // SAFETY: pointers verified within mapped PE module bounds.
+            unsafe {
+                *fb_tr = target_tr;
+                *fb_sp = target_sp;
+            }
+        }
+
+        // 2. Sample rate core initialization:
+        let base_sr = sample_rate;
+
+        // SAFETY: Invoking VST 2.4 effSetSampleRate dispatcher opcode and DSP core vtable[6] under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
-            // Opcode 10 = effSetSampleRate in VST 2.4
+            // Opcode 10 = effSetSampleRate in VST 2.4 (wrapper sets its internal sampleRate)
             ((*self.effect).dispatcher)(self.effect, 10, 0, 0, ptr::null_mut(), sample_rate);
+
+            let obj = (*self.effect).object.cast::<*mut usize>();
+            if !obj.is_null() {
+                let vtable = *obj;
+                if !vtable.is_null() {
+                    let dsp_set_sr_fn = *vtable.add(6);
+                    std::arch::asm!(
+                        "push {sr}",
+                        "call {set_sr}",
+                        sr = in(reg) base_sr.to_bits(),
+                        set_sr = in(reg) dsp_set_sr_fn,
+                        in("ecx") obj,
+                        clobber_abi("C"),
+                    );
+                }
+            }
+        }
+
+        // 3. Overwrite internal sample rate fields with target sample rate
+        // SAFETY: Reading effect object pointer.
+        let obj_u8 = unsafe { (*self.effect).object.cast::<u8>() };
+        if !obj_u8.is_null() {
+            if let Some(off_f64) = self.filter_adapter.sr_f64_offset {
+                // SAFETY: off_f64 verified within DSP object bounds.
+                unsafe {
+                    std::ptr::write_unaligned(
+                        obj_u8.add(off_f64).cast::<f64>(),
+                        f64::from(sample_rate),
+                    );
+                }
+            }
+            if let Some(off_i32) = self.filter_adapter.sr_i32_offset {
+                // If this is HPS with a buffer at 0x148 sized to [obj + 0xec] * 8, resize buffer
+                if off_i32 == 0xec {
+                    // SAFETY: Checking buffer pointer at 0x148
+                    unsafe {
+                        let p_buf = obj_u8.add(0x148).cast::<*mut f64>();
+                        let old_buf = std::ptr::read_unaligned(p_buf);
+                        if is_plausible_heap_buf(old_buf as usize) {
+                            let new_byte_size =
+                                usize::try_from(sr_i32).unwrap_or(0) * std::mem::size_of::<f64>();
+                            let new_buf =
+                                libc::realloc(old_buf.cast::<libc::c_void>(), new_byte_size)
+                                    .cast::<f64>();
+                            if !new_buf.is_null() {
+                                let old_u = old_buf as usize;
+                                let new_u = new_buf as usize;
+                                for slot in &TRACKED_ALLOCS {
+                                    if slot
+                                        .compare_exchange(
+                                            old_u,
+                                            new_u,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        break;
+                                    }
+                                }
+                                std::ptr::write_unaligned(p_buf, new_buf);
+                            }
+                        }
+                    }
+                }
+                // SAFETY: off_i32 verified within DSP object bounds.
+                unsafe {
+                    std::ptr::write_unaligned(obj_u8.add(off_i32).cast::<i32>(), sr_i32);
+                }
+            }
+
+            // 4. Comb filter delay adaptation
+            if let (Some(len_off), Some(base_len)) = (
+                self.filter_adapter.comb_len_offset,
+                self.filter_adapter.comb_len_base,
+            ) {
+                // SAFETY: comb offsets verified within DSP object bounds.
+                unsafe {
+                    let current_len = std::ptr::read_unaligned(obj_u8.add(len_off).cast::<u32>());
+                    let ratio = f64::from(sample_rate) / 48000.0;
+                    #[allow(clippy::cast_sign_loss)]
+                    let new_len = (f64::from(base_len) * ratio).round() as u32;
+                    if new_len != current_len && new_len > 0 {
+                        if let Some(buf_off) = self.filter_adapter.comb_buf_offset {
+                            let old_buf =
+                                std::ptr::read_unaligned(obj_u8.add(buf_off).cast::<*mut f64>());
+                            if is_plausible_heap_buf(old_buf as usize) {
+                                let new_byte_size = usize::try_from(new_len).unwrap_or(0)
+                                    * std::mem::size_of::<f64>();
+                                let new_buf =
+                                    libc::realloc(old_buf.cast::<libc::c_void>(), new_byte_size)
+                                        .cast::<f64>();
+                                if !new_buf.is_null() {
+                                    let old_u = old_buf as usize;
+                                    let new_u = new_buf as usize;
+                                    for slot in &TRACKED_ALLOCS {
+                                        if slot
+                                            .compare_exchange(
+                                                old_u,
+                                                new_u,
+                                                Ordering::Relaxed,
+                                                Ordering::Relaxed,
+                                            )
+                                            .is_ok()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    if new_len > current_len {
+                                        let added_samples =
+                                            usize::try_from(new_len - current_len).unwrap_or(0);
+                                        let added_ptr =
+                                            new_buf.add(usize::try_from(current_len).unwrap_or(0));
+                                        std::ptr::write_bytes(added_ptr, 0, added_samples);
+                                    }
+                                    std::ptr::write_unaligned(
+                                        obj_u8.add(buf_off).cast::<*mut f64>(),
+                                        new_buf,
+                                    );
+                                    std::ptr::write_unaligned(
+                                        obj_u8.add(len_off).cast::<u32>(),
+                                        new_len,
+                                    );
+                                    eprintln!(
+                                        "[peldr] Resized comb delay buffer: {current_len} -> {new_len} samples (base_48k={base_len})"
+                                    );
+                                }
+                            }
+                        } else {
+                            std::ptr::write_unaligned(obj_u8.add(len_off).cast::<u32>(), new_len);
+                            eprintln!(
+                                "[peldr] Scaled inline comb/iter len: {current_len} -> {new_len} (base_48k={base_len})"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 5. Restore comb feedback gain if applicable
+            if let (Some(len_off), Some(g_base)) = (
+                self.filter_adapter.comb_len_offset,
+                self.filter_adapter.comb_gain_base,
+            ) {
+                if len_off >= 8 {
+                    // SAFETY: len_off verified within DSP object bounds.
+                    unsafe {
+                        std::ptr::write_unaligned(obj_u8.add(len_off - 8).cast::<f64>(), g_base);
+                    }
+                }
+            }
+
+            // 6. Wah multiplier adaptation
+            if let Some(wah_off) = self.filter_adapter.wah_offset {
+                let ratio = 48000.0 / f64::from(sample_rate);
+                let target_wah = self.filter_adapter.wah_base_multiplier * ratio;
+                // SAFETY: wah_off and sub-objects verified within DSP object bounds.
+                unsafe {
+                    std::ptr::write_unaligned(obj_u8.add(wah_off).cast::<f64>(), target_wah);
+
+                    if wah_off == 0x1c8 {
+                        // Auto_Wah SVF range and min coefficients
+                        std::ptr::write_unaligned(obj_u8.add(0x1a8).cast::<f64>(), 0.005 * ratio);
+                        std::ptr::write_unaligned(obj_u8.add(0x1b0).cast::<f64>(), 0.03 * ratio);
+
+                        let p_sub1 = std::ptr::read_unaligned(obj_u8.add(0x134).cast::<*mut u8>());
+                        if is_plausible_heap_buf(p_sub1 as usize) {
+                            std::ptr::write_unaligned(
+                                p_sub1.add(0x8).cast::<f64>(),
+                                0.137_812_5 * ratio,
+                            );
+                        }
+                        let p_sub3 = std::ptr::read_unaligned(obj_u8.add(0x13c).cast::<*mut u8>());
+                        if is_plausible_heap_buf(p_sub3 as usize) {
+                            std::ptr::write_unaligned(p_sub3.add(0x8).cast::<f64>(), 0.55 * ratio);
+                            std::ptr::write_unaligned(p_sub3.add(0x10).cast::<f64>(), 0.1 * ratio);
+                        }
+                    } else if wah_off == 0x1e0 {
+                        // PEDAL_CRY resonator normalized frequency parameter
+                        let p_sub0 = std::ptr::read_unaligned(obj_u8.add(0x114).cast::<*mut u8>());
+                        if is_plausible_heap_buf(p_sub0 as usize) {
+                            std::ptr::write_unaligned(p_sub0.add(0x8).cast::<f64>(), 0.5 * ratio);
+                            std::ptr::write_unaligned(p_sub0.add(0x10).cast::<f64>(), 0.05 * ratio);
+                        }
+                        std::ptr::write_unaligned(obj_u8.add(0x1a0).cast::<f64>(), 0.5 * ratio);
+                        std::ptr::write_unaligned(obj_u8.add(0x1e8).cast::<f64>(), 0.5 * ratio);
+                    }
+                }
+            }
+
+            // 7. 5th-order cabinet / tone filter adaptation
+            if let Some(off) = self.filter_adapter.order5_offset {
+                let (b_new, a_new) = analog_proto::transform_order5(
+                    self.filter_adapter.order5_base_b,
+                    self.filter_adapter.order5_base_a,
+                    48000.0,
+                    f64::from(sample_rate),
+                );
+                let target_coeffs = Order5Coeffs { a: a_new, b: b_new };
+                // SAFETY: off verified within DSP object bounds.
+                unsafe {
+                    std::ptr::write_unaligned(
+                        obj_u8.add(off).cast::<Order5Coeffs>(),
+                        target_coeffs,
+                    );
+
+                    // Also re-warp any channel sub-objects (e.g. at 0x1a8, 0x1ac, 0x1b0, etc.)
+                    for sub_off in (0x100..0x200).step_by(4) {
+                        let p_sub = std::ptr::read_unaligned(obj_u8.add(sub_off).cast::<*mut u8>());
+                        if is_plausible_heap_buf(p_sub as usize) {
+                            let sub_coeffs =
+                                std::ptr::read_unaligned(p_sub.add(0x40).cast::<Order5Coeffs>());
+                            if (4.0..5.5).contains(&sub_coeffs.a[0])
+                                && (0.5..0.98).contains(&sub_coeffs.a[4])
+                            {
+                                std::ptr::write_unaligned(
+                                    p_sub.add(0x40).cast::<Order5Coeffs>(),
+                                    target_coeffs,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 8. Biquad re-warping if any discovered
+            for &off in &self.filter_adapter.biquad_offsets[..self.filter_adapter.num_biquads] {
+                // SAFETY: biquad offsets verified within DSP object bounds.
+                unsafe {
+                    let old_biquad =
+                        std::ptr::read_unaligned(obj_u8.add(off).cast::<BiquadCoeffs>());
+                    let (b_new, a_new) = analog_proto::transform_biquad(
+                        old_biquad.b,
+                        [1.0, old_biquad.a[0], old_biquad.a[1]],
+                        48000.0,
+                        f64::from(sample_rate),
+                    );
+                    let new_biquad = BiquadCoeffs {
+                        b: b_new,
+                        a: [a_new[1], a_new[2]],
+                    };
+                    std::ptr::write_unaligned(obj_u8.add(off).cast::<BiquadCoeffs>(), new_biquad);
+                }
+            }
         }
     }
 
     pub fn set_block_size(&self, block_size: i32) {
         CURRENT_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
-        // SAFETY: Invoking VST 2.4 effSetBlockSize dispatcher opcode under Win32ContextGuard.
+        // SAFETY: Invoking VST 2.4 effSetBlockSize dispatcher opcode and DSP core vtable[7] under Win32ContextGuard.
         unsafe {
             let _guard = Win32ContextGuard::enter();
             // Opcode 11 = effSetBlockSize in VST 2.4
@@ -604,6 +1372,22 @@ impl ZfxDspInstance {
                 ptr::null_mut(),
                 0.0,
             );
+
+            let obj = (*self.effect).object.cast::<*mut usize>();
+            if !obj.is_null() {
+                let vtable = *obj;
+                if !vtable.is_null() {
+                    let dsp_set_bs_fn = *vtable.add(7);
+                    std::arch::asm!(
+                        "push {bs}",
+                        "call {set_bs}",
+                        bs = in(reg) block_size,
+                        set_bs = in(reg) dsp_set_bs_fn,
+                        in("ecx") obj,
+                        clobber_abi("C"),
+                    );
+                }
+            }
         }
     }
 
@@ -628,9 +1412,16 @@ impl ZfxDspInstance {
 
 impl Drop for PeModule {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         // SAFETY: Unmapping memory allocated via libc::mmap during PeModule::load.
         unsafe {
             libc::munmap(self.base_addr, self.size);
+        }
+        #[cfg(target_os = "windows")]
+        // SAFETY: Freeing memory allocated via VirtualAlloc during PeModule::load.
+        unsafe {
+            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            VirtualFree(self.base_addr, 0, MEM_RELEASE);
         }
     }
 }
@@ -657,6 +1448,17 @@ pub struct VstTimeInfo {
     pub flags: i32,
 }
 
+bitflags::bitflags! {
+    /// VST 2.4 VstTimeInfo flags bitmask for `audioMasterGetTime` host callback.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VstTimeInfoFlags: i32 {
+        const TRANSPORT_PLAYING = 1 << 1;  // 0x0002
+        const PPQ_POS_VALID     = 1 << 9;  // 0x0200
+        const TEMPO_VALID       = 1 << 10; // 0x0400
+        const TIME_SIG_VALID    = 1 << 13; // 0x2000
+    }
+}
+
 pub static mut CURRENT_TIME_INFO: VstTimeInfo = VstTimeInfo {
     sample_pos: 0.0,
     sample_rate: 44100.0,
@@ -671,8 +1473,10 @@ pub static mut CURRENT_TIME_INFO: VstTimeInfo = VstTimeInfo {
     smpte_offset: 0,
     smpte_frame_rate: 24,
     samples_to_next_clock: 0,
-    // kVstTransportPlaying (2) | kVstTempoValid (1024) | kVstPpqPosValid (512) | kVstTimeSigValid (8192)
-    flags: 0x0002 | 0x0400 | 0x0200 | 0x2000,
+    flags: VstTimeInfoFlags::TRANSPORT_PLAYING.bits()
+        | VstTimeInfoFlags::TEMPO_VALID.bits()
+        | VstTimeInfoFlags::PPQ_POS_VALID.bits()
+        | VstTimeInfoFlags::TIME_SIG_VALID.bits(),
 };
 
 // --- VST 2.4 Host Audio Master Callback ---
@@ -809,6 +1613,7 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
 }
 
 // --- Win32 TEB and Thread Area Setup ---
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct UserDesc {
     entry_number: u32,
@@ -817,11 +1622,15 @@ struct UserDesc {
     flags: u32,
 }
 
+#[cfg(target_os = "linux")]
 static mut WIN32_TEB: [u32; 1024] = [0; 1024];
+#[cfg(target_os = "linux")]
 static mut TEB_SELECTOR: u16 = 0;
 
+#[allow(clippy::missing_const_for_fn)]
 pub fn init_win32_teb() {
-    // SAFETY: Setting up thread-local storage segment selector (FS) for Win32 TEB on x86.
+    #[cfg(target_os = "linux")]
+    // SAFETY: Setting up thread-local storage segment selector (FS) for Win32 TEB on x86 Linux.
     unsafe {
         if TEB_SELECTOR != 0 {
             return;
@@ -849,6 +1658,10 @@ pub fn init_win32_teb() {
             eprintln!("[peldr] Warning: SYS_set_thread_area returned {res}");
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        // 32-bit Windows operating system automatically manages FS register and Win32 TEB.
+    }
 }
 
 pub struct Win32ContextGuard {
@@ -863,7 +1676,10 @@ impl Win32ContextGuard {
     #[inline]
     pub unsafe fn enter() -> Self {
         let mut saved_fs: u16 = 0;
+        #[cfg(target_os = "linux")]
         let sel = TEB_SELECTOR;
+        #[cfg(not(target_os = "linux"))]
+        let sel = 0u16;
         if sel != 0 {
             // SAFETY: Swapping FS segment register with Win32 TEB selector.
             unsafe {
@@ -1049,12 +1865,26 @@ pub const unsafe extern "stdcall" fn hook_GetCurrentProcess() -> *mut c_void {
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetCurrentProcessId() -> u32 {
-    libc::getpid().cast_unsigned()
+    #[cfg(unix)]
+    {
+        libc::getpid().cast_unsigned()
+    }
+    #[cfg(windows)]
+    {
+        windows_sys::Win32::System::Threading::GetCurrentProcessId()
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "stdcall" fn hook_GetCurrentThreadId() -> u32 {
-    libc::pthread_self()
+    #[cfg(unix)]
+    {
+        libc::pthread_self()
+    }
+    #[cfg(windows)]
+    {
+        windows_sys::Win32::System::Threading::GetCurrentThreadId()
+    }
 }
 
 #[no_mangle]
@@ -1145,15 +1975,38 @@ pub const unsafe extern "stdcall" fn hook_TerminateProcess(_h: *mut c_void, _cod
 // --- MSVCR80 CRT Trampolines ---
 
 #[no_mangle]
+#[allow(clippy::as_conversions)]
 pub unsafe extern "C" fn hook_malloc(size: usize) -> *mut c_void {
     let p = libc::malloc(size);
-    eprintln!("[hook_malloc] size={size} -> {p:?}");
+    if !p.is_null() {
+        let u = p as usize;
+        for slot in &TRACKED_ALLOCS {
+            if slot
+                .compare_exchange(0, u, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
     p
 }
 
 #[no_mangle]
+#[allow(clippy::as_conversions)]
 pub unsafe extern "C" fn hook_free(ptr: *mut c_void) {
-    libc::free(ptr);
+    if !ptr.is_null() {
+        let u = ptr as usize;
+        for slot in &TRACKED_ALLOCS {
+            if slot
+                .compare_exchange(u, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        libc::free(ptr);
+    }
 }
 
 #[no_mangle]

@@ -1,7 +1,7 @@
 use std::sync::atomic::AtomicU32;
 
 pub const BRIDGE_MAGIC: u32 = 0x5A46_5842; // 'ZFXB'
-pub const MAX_FRAMES: usize = 4096;
+pub const MAX_FRAMES: usize = 16384;
 pub const MAX_PARAMS: usize = 128;
 pub const MAX_PARAM_QUEUE: usize = 64;
 pub const MAX_PAYLOAD_SIZE: usize = 512 * 1024; // 512 KB
@@ -16,15 +16,17 @@ pub const STATUS_BUSY: u32 = 1;
 pub const STATUS_OK: u32 = 2;
 pub const STATUS_ERROR: u32 = 3;
 
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct ParamChange {
     pub id: u32,
     pub value: f32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct ParamMeta {
     pub id: u32,
     pub name: [u8; 32],
@@ -114,22 +116,43 @@ impl ZfxSharedBridge {
 /// `val_addr` must be non-null and point to a valid, aligned `AtomicU32` in shared memory.
 #[inline]
 pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: Option<u64>) {
-    let ts = timeout_us.map(|us| libc::timespec {
-        tv_sec: (us / 1_000_000).cast_signed(),
-        tv_nsec: ((us % 1_000_000) * 1_000).cast_signed(),
-    });
-    let ts_ptr = ts
-        .as_ref()
-        .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>);
-    libc::syscall(
-        libc::SYS_futex,
-        val_addr,
-        libc::FUTEX_WAIT,
-        expected,
-        ts_ptr,
-        std::ptr::null::<u32>(),
-        0,
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let ts = timeout_us.and_then(|us| {
+            let sec = libc::time_t::try_from(us / 1_000_000).ok()?;
+            let nsec = libc::c_long::try_from((us % 1_000_000) * 1_000).ok()?;
+            Some(libc::timespec {
+                tv_sec: sec,
+                tv_nsec: nsec,
+            })
+        });
+        let ts_ptr = ts
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>);
+        libc::syscall(
+            libc::SYS_futex,
+            val_addr,
+            libc::FUTEX_WAIT,
+            expected,
+            ts_ptr,
+            std::ptr::null::<u32>(),
+            0,
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Threading::WaitOnAddress;
+        let wait_ms = timeout_us.map_or(u32::MAX, |us| {
+            u32::try_from((us / 1_000).max(1)).unwrap_or(u32::MAX)
+        });
+        let undisaligned_expected = expected;
+        WaitOnAddress(
+            val_addr.cast(),
+            std::ptr::from_ref(&undisaligned_expected).cast(),
+            4,
+            wait_ms,
+        );
+    }
 }
 
 /// # Safety
@@ -137,13 +160,26 @@ pub unsafe fn futex_wait(val_addr: *const AtomicU32, expected: u32, timeout_us: 
 /// `val_addr` must be non-null and point to a valid, aligned `AtomicU32` in shared memory.
 #[inline]
 pub unsafe fn futex_wake(val_addr: *const AtomicU32) {
-    libc::syscall(
-        libc::SYS_futex,
-        val_addr,
-        libc::FUTEX_WAKE,
-        1, // wake 1 waiter
-        std::ptr::null::<libc::timespec>(),
-        std::ptr::null::<u32>(),
-        0,
-    );
+    #[cfg(target_os = "linux")]
+    {
+        libc::syscall(
+            libc::SYS_futex,
+            val_addr,
+            libc::FUTEX_WAKE,
+            1, // wake 1 waiter
+            std::ptr::null::<libc::timespec>(),
+            std::ptr::null::<u32>(),
+            0,
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Threading::WakeByAddressSingle;
+        WakeByAddressSingle(val_addr.cast());
+    }
 }
+
+const _: () = assert!(std::mem::size_of::<ParamChange>() == 8);
+const _: () = assert!(std::mem::align_of::<ParamChange>() == 4);
+const _: () = assert!(std::mem::size_of::<ParamMeta>() == 40);
+const _: () = assert!(std::mem::align_of::<ParamMeta>() == 4);

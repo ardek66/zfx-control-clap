@@ -12,16 +12,30 @@ use clack_plugin::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-struct ClapWindowWrapper(core::ffi::c_ulong);
+struct ClapWindowWrapper(u64);
 
 impl raw_window_handle::HasWindowHandle for ClapWindowWrapper {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        let handle = raw_window_handle::XlibWindowHandle::new(self.0);
-        let raw = raw_window_handle::RawWindowHandle::Xlib(handle);
-        // SAFETY: `raw` contains a valid Xlib window handle wrapping `self.0` that outlives this borrow.
-        unsafe { Ok(raw_window_handle::WindowHandle::borrow_raw(raw)) }
+        #[cfg(target_os = "linux")]
+        {
+            let handle = raw_window_handle::XlibWindowHandle::new(self.0 as core::ffi::c_ulong);
+            let raw = raw_window_handle::RawWindowHandle::Xlib(handle);
+            // SAFETY: `raw` contains a valid Xlib window handle wrapping `self.0` that outlives this borrow.
+            unsafe { Ok(raw_window_handle::WindowHandle::borrow_raw(raw)) }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let non_zero = isize::try_from(self.0)
+                .ok()
+                .and_then(std::num::NonZeroIsize::new)
+                .ok_or(raw_window_handle::HandleError::Unavailable)?;
+            let handle = raw_window_handle::Win32WindowHandle::new(non_zero);
+            let raw = raw_window_handle::RawWindowHandle::Win32(handle);
+            // SAFETY: `raw` contains a valid Win32 HWND handle wrapping `self.0` that outlives this borrow.
+            unsafe { Ok(raw_window_handle::WindowHandle::borrow_raw(raw)) }
+        }
     }
 }
 
@@ -36,8 +50,8 @@ pub fn find_asset(path: &str) -> Option<&'static [u8]> {
         return None;
     }
 
-    // Normalize any ":" to "/" (e.g. "Common:Knob" -> "Common/Knob", "Common:FootSw" -> "Common/FootSw")
-    let normalized = raw.replace(':', "/");
+    // Normalize any "\" or ":" to "/" (e.g. "Common:Knob" -> "Common/Knob", "Common:FootSw" -> "Common/FootSw")
+    let normalized = raw.replace(['\\', ':'], "/");
 
     let mut candidates = Vec::new();
     candidates.push(normalized.clone());
@@ -128,20 +142,11 @@ pub fn probe_frame_count(base: &str, declared_max: Option<u32>) -> usize {
         }
     }
 
-    let mut count = 0;
-    while find_frame_asset(base, count).is_some() {
-        count += 1;
-        if count >= 256 {
-            break;
-        }
-    }
+    let count = (0..256)
+        .take_while(|&count| find_frame_asset(base, count).is_some())
+        .count();
 
-    if count > 0 {
-        count
-    } else {
-        // Fallback: If no indexed frames found, treat as 1 frame
-        1
-    }
+    count.max(1)
 }
 
 #[must_use]
@@ -163,6 +168,10 @@ pub struct ZfxApp {
     param_values: Arc<RwLock<HashMap<u32, f64>>>,
     param_defs: HashMap<u32, PluginParamDef>,
     gui_events: Arc<Mutex<Vec<GuiParamEvent>>>,
+    #[cfg(feature = "feat_oversampling")]
+    oversampling_mode: Arc<std::sync::atomic::AtomicU8>,
+    #[cfg(feature = "feat_oversampling")]
+    oversampling_phase: Arc<std::sync::atomic::AtomicU8>,
     textures: HashMap<String, egui::TextureHandle>,
     frame_counts: HashMap<String, usize>,
     bkgd_texture_name: Option<String>,
@@ -170,16 +179,17 @@ pub struct ZfxApp {
 }
 
 impl ZfxApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: Option<EfxTypeInfo>,
         param_values: Arc<RwLock<HashMap<u32, f64>>>,
         param_defs_list: Vec<PluginParamDef>,
         gui_events: Arc<Mutex<Vec<GuiParamEvent>>>,
+        #[cfg(feature = "feat_oversampling")] oversampling_mode: Arc<std::sync::atomic::AtomicU8>,
+        #[cfg(feature = "feat_oversampling")] oversampling_phase: Arc<std::sync::atomic::AtomicU8>,
     ) -> Self {
-        let mut param_defs = HashMap::new();
-        for p in param_defs_list {
-            param_defs.insert(p.id, p);
-        }
+        let param_defs: HashMap<u32, PluginParamDef> =
+            param_defs_list.into_iter().map(|p| (p.id, p)).collect();
         let bkgd_texture_name = layout
             .as_ref()
             .and_then(|l| l.total.bkgd_img.as_ref())
@@ -191,6 +201,10 @@ impl ZfxApp {
             param_values,
             param_defs,
             gui_events,
+            #[cfg(feature = "feat_oversampling")]
+            oversampling_mode,
+            #[cfg(feature = "feat_oversampling")]
+            oversampling_phase,
             textures: HashMap::new(),
             frame_counts: HashMap::new(),
             bkgd_texture_name,
@@ -273,24 +287,25 @@ impl ZfxApp {
             candidates.push(format!("{p_name}.png"));
             candidates.push(format!("{p_name}.jpg"));
 
-            for cand in candidates {
-                if let Some(bytes) = find_asset(&cand) {
-                    if let Some(tex) = load_texture(ctx, "bkgd", bytes) {
-                        eprintln!(
-                            "[ZFX GUI] Loaded background texture '{}' (size: {}x{})",
-                            cand,
-                            tex.size()[0],
-                            tex.size()[1]
-                        );
-                        self.textures.insert("bkgd".to_string(), tex);
-                        break;
-                    }
-                }
+            let loaded = candidates.iter().find_map(|cand| {
+                let bytes = find_asset(cand)?;
+                let tex = load_texture(ctx, "bkgd", bytes)?;
+                Some((cand, tex))
+            });
+            if let Some((cand, tex)) = loaded {
+                eprintln!(
+                    "[ZFX GUI] Loaded background texture '{}' (size: {}x{})",
+                    cand,
+                    tex.size()[0],
+                    tex.size()[1]
+                );
+                self.textures.insert("bkgd".to_string(), tex);
             }
         }
         self.textures.get("bkgd")
     }
 
+    #[cfg(feature = "feat_mic_ui")]
     fn get_or_load_mic_texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
         if !self.textures.contains_key("mic_tex") {
             let candidates = [
@@ -304,22 +319,231 @@ impl ZfxApp {
                 "bkgd.png",
                 "Bkgd.png",
             ];
-            for cand in candidates {
-                if let Some(bytes) = find_asset(cand) {
-                    if let Some(tex) = load_texture(ctx, "mic_tex", bytes) {
-                        eprintln!(
-                            "[ZFX GUI] Loaded mic texture '{}' (size: {}x{})",
-                            cand,
-                            tex.size()[0],
-                            tex.size()[1]
-                        );
-                        self.textures.insert("mic_tex".to_string(), tex);
-                        break;
-                    }
-                }
+            let loaded = candidates.iter().find_map(|&cand| {
+                let bytes = find_asset(cand)?;
+                let tex = load_texture(ctx, "mic_tex", bytes)?;
+                Some((cand, tex))
+            });
+            if let Some((cand, tex)) = loaded {
+                eprintln!(
+                    "[ZFX GUI] Loaded mic texture '{}' (size: {}x{})",
+                    cand,
+                    tex.size()[0],
+                    tex.size()[1]
+                );
+                self.textures.insert("mic_tex".to_string(), tex);
             }
         }
         self.textures.get("mic_tex")
+    }
+
+    #[cfg(feature = "feat_oversampling")]
+    #[allow(clippy::too_many_lines)]
+    fn render_oversampling_badge(
+        ui: &mut egui::Ui,
+        pos: egui::Pos2,
+        oversampling_mode: &std::sync::atomic::AtomicU8,
+        oversampling_phase: &std::sync::atomic::AtomicU8,
+    ) {
+        let cur_u8 = oversampling_mode.load(std::sync::atomic::Ordering::Acquire);
+        let cur_mode = crate::resampler::OversamplingMode::from_u8(cur_u8);
+        let cur_phase_u8 = oversampling_phase.load(std::sync::atomic::Ordering::Acquire);
+        let cur_phase = crate::resampler::OversamplingPhase::from_u8(cur_phase_u8);
+
+        let mode_w = 90.0;
+        let pill_h = 20.0;
+        let mode_rect = egui::Rect::from_min_size(pos, egui::vec2(mode_w, pill_h));
+
+        // 1. Oversampling Mode Pill [ 1x | 2x | 4x ]
+        ui.painter().rect_filled(
+            mode_rect,
+            10.0,
+            egui::Color32::from_rgba_premultiplied(16, 17, 20, 220),
+        );
+        ui.painter().rect_stroke(
+            mode_rect,
+            10.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(65, 70, 82, 200)),
+            egui::StrokeKind::Inside,
+        );
+
+        let seg_w = mode_w / 3.0;
+        let modes = [
+            (
+                crate::resampler::OversamplingMode::Off,
+                "1x",
+                "1x: Native Rate (0 samples latency)",
+            ),
+            (
+                crate::resampler::OversamplingMode::Double,
+                "2x",
+                match cur_phase {
+                    crate::resampler::OversamplingPhase::Linear => {
+                        "2x: Linear-Phase FIR (15 samples PDC)"
+                    }
+                    crate::resampler::OversamplingPhase::Minimum => {
+                        "2x: Minimum-Phase FIR (2 samples PDC, zero pre-ringing)"
+                    }
+                },
+            ),
+            (
+                crate::resampler::OversamplingMode::Quad,
+                "4x",
+                match cur_phase {
+                    crate::resampler::OversamplingPhase::Linear => {
+                        "4x: Linear-Phase FIR (23 samples PDC)"
+                    }
+                    crate::resampler::OversamplingPhase::Minimum => {
+                        "4x: Minimum-Phase FIR (3 samples PDC, zero pre-ringing)"
+                    }
+                },
+            ),
+        ];
+
+        for (idx, (m, label, tooltip)) in modes.iter().enumerate() {
+            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            let seg_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    (idx as f32).mul_add(seg_w, mode_rect.left()),
+                    mode_rect.top(),
+                ),
+                egui::vec2(seg_w, pill_h),
+            );
+            let resp = ui.allocate_rect(seg_rect, egui::Sense::click());
+            let is_selected = cur_mode == *m;
+            let is_hovered = resp.hovered();
+
+            if resp.clicked() && !is_selected {
+                oversampling_mode.store(m.to_u8(), std::sync::atomic::Ordering::Release);
+            }
+
+            resp.on_hover_ui(|ui| {
+                ui.label(*tooltip);
+            });
+
+            if is_selected {
+                ui.painter().rect_filled(
+                    seg_rect.shrink(1.5),
+                    8.0,
+                    egui::Color32::from_rgb(230, 165, 45),
+                );
+                ui.painter().text(
+                    seg_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(20, 20, 24),
+                );
+            } else {
+                let text_color = if is_hovered {
+                    egui::Color32::from_rgb(220, 225, 235)
+                } else {
+                    egui::Color32::from_rgb(140, 145, 155)
+                };
+                ui.painter().text(
+                    seg_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(10.5),
+                    text_color,
+                );
+            }
+        }
+
+        // 2. Oversampling Phase Pill [ Lin | Min ]
+        let phase_w = 70.0;
+        let phase_rect = egui::Rect::from_min_size(
+            egui::pos2(mode_rect.right() + 6.0, mode_rect.top()),
+            egui::vec2(phase_w, pill_h),
+        );
+
+        let is_active = cur_mode != crate::resampler::OversamplingMode::Off;
+        let bg_color = if is_active {
+            egui::Color32::from_rgba_premultiplied(16, 17, 20, 220)
+        } else {
+            egui::Color32::from_rgba_premultiplied(16, 17, 20, 140)
+        };
+        let border_color = if is_active {
+            egui::Color32::from_rgba_premultiplied(65, 70, 82, 200)
+        } else {
+            egui::Color32::from_rgba_premultiplied(50, 52, 60, 120)
+        };
+
+        ui.painter().rect_filled(phase_rect, 10.0, bg_color);
+        ui.painter().rect_stroke(
+            phase_rect,
+            10.0,
+            egui::Stroke::new(1.0, border_color),
+            egui::StrokeKind::Inside,
+        );
+
+        let phase_seg_w = phase_w / 2.0;
+        let phases = [
+            (
+                crate::resampler::OversamplingPhase::Linear,
+                "Lin",
+                "Linear Phase: Flat group delay, symmetric Kaiser FIR (15/23 smp PDC). Best for multi-mic phase alignment.",
+            ),
+            (
+                crate::resampler::OversamplingPhase::Minimum,
+                "Min",
+                "Minimum Phase: Zero pre-ringing, ultra-low latency (2/3 smp PDC). Best for sharp pick attack & live tracking.",
+            ),
+        ];
+
+        for (idx, (p, label, tooltip)) in phases.iter().enumerate() {
+            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            let seg_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    (idx as f32).mul_add(phase_seg_w, phase_rect.left()),
+                    phase_rect.top(),
+                ),
+                egui::vec2(phase_seg_w, pill_h),
+            );
+            let resp = ui.allocate_rect(seg_rect, egui::Sense::click());
+            let is_selected = cur_phase == *p;
+            let is_hovered = resp.hovered();
+
+            if resp.clicked() && !is_selected {
+                oversampling_phase.store(p.to_u8(), std::sync::atomic::Ordering::Release);
+            }
+
+            resp.on_hover_ui(|ui| {
+                ui.label(*tooltip);
+            });
+
+            if is_selected {
+                let badge_color = if is_active {
+                    egui::Color32::from_rgb(230, 165, 45)
+                } else {
+                    egui::Color32::from_rgb(160, 125, 55)
+                };
+                ui.painter()
+                    .rect_filled(seg_rect.shrink(1.5), 8.0, badge_color);
+                ui.painter().text(
+                    seg_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(10.5),
+                    egui::Color32::from_rgb(20, 20, 24),
+                );
+            } else {
+                let text_color = if is_hovered {
+                    egui::Color32::from_rgb(220, 225, 235)
+                } else if is_active {
+                    egui::Color32::from_rgb(140, 145, 155)
+                } else {
+                    egui::Color32::from_rgb(90, 95, 105)
+                };
+                ui.painter().text(
+                    seg_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    *label,
+                    egui::FontId::proportional(10.0),
+                    text_color,
+                );
+            }
+        }
     }
 }
 
@@ -330,7 +554,9 @@ pub fn get_window_size(layout: Option<&EfxTypeInfo>) -> (f64, f64) {
         let w = crate::NATIVE_BKGD_WIDTH.unwrap_or(430.0);
         let h = crate::NATIVE_BKGD_HEIGHT.unwrap_or(570.0);
         (w, h)
-    } else if cat == "mic" || layout.is_some_and(|l| l.total.width <= 100.0) {
+    } else if cfg!(feature = "feat_mic_ui")
+        && (cat == "mic" || layout.is_some_and(|l| l.total.width <= 100.0))
+    {
         (400.0, 440.0)
     } else if let Some(layout) = layout {
         (
@@ -365,6 +591,7 @@ impl egui_baseview::App for ZfxApp {
         let cat = crate::PLUGIN_CATEGORY.to_lowercase();
         let is_cabinet =
             cat == "cabinet" || self.layout.as_ref().is_some_and(|l| l.total.width > 1000.0);
+        #[cfg(feature = "feat_mic_ui")]
         let is_mic = cat == "mic" || self.layout.as_ref().is_some_and(|l| l.total.width <= 100.0);
 
         if is_cabinet {
@@ -384,9 +611,17 @@ impl egui_baseview::App for ZfxApp {
                     egui::Color32::WHITE,
                 );
             }
+            #[cfg(feature = "feat_oversampling")]
+            Self::render_oversampling_badge(
+                ui,
+                egui::pos2(win_w - 176.0, 10.0),
+                &self.oversampling_mode,
+                &self.oversampling_phase,
+            );
             return;
         }
 
+        #[cfg(feature = "feat_mic_ui")]
         if is_mic {
             let (win_width, win_height) = get_window_size(self.layout.as_ref());
             let win_w = win_width as f32;
@@ -768,6 +1003,14 @@ impl egui_baseview::App for ZfxApp {
                 events_lock.extend(new_gui_events);
             }
 
+            #[cfg(feature = "feat_oversampling")]
+            Self::render_oversampling_badge(
+                ui,
+                egui::pos2(win_w - 188.0, 15.0),
+                &self.oversampling_mode,
+                &self.oversampling_phase,
+            );
+
             return;
         }
 
@@ -805,7 +1048,8 @@ impl egui_baseview::App for ZfxApp {
                 let max_val = prm_def
                     .map_or_else(|| f64::from(ctrl.max.unwrap_or(100)), |p| p.max_value)
                     .max(min_val + 1e-4);
-                let def_val = prm_def.map_or((min_val + max_val) * 0.5, |p| p.default_value);
+                let def_val =
+                    prm_def.map_or_else(|| min_val.midpoint(max_val), |p| p.default_value);
                 let param_name = prm_def
                     .map(|p| p.name.trim_end_matches('\0'))
                     .or(ctrl.name.as_deref())
@@ -1030,7 +1274,7 @@ impl egui_baseview::App for ZfxApp {
 
                     "PushKey" | "Toggle" => {
                         let response = ui.allocate_rect(ctrl_rect, egui::Sense::click());
-                        let mid = (min_val + max_val) * 0.5;
+                        let mid = min_val.midpoint(max_val);
                         let is_on = cur_val >= mid;
 
                         if response.clicked() {
@@ -1315,6 +1559,14 @@ impl egui_baseview::App for ZfxApp {
                     evs.extend(new_gui_events);
                 }
             }
+
+            #[cfg(feature = "feat_oversampling")]
+            Self::render_oversampling_badge(
+                ui,
+                egui::pos2(win_w - 176.0, 10.0),
+                &self.oversampling_mode,
+                &self.oversampling_phase,
+            );
         }
     }
 }
@@ -1323,10 +1575,16 @@ impl egui_baseview::App for ZfxApp {
 // CLAP GUI Extension Implementation
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
+const PREFERRED_API: clack_extensions::gui::GuiApiType<'static> =
+    clack_extensions::gui::GuiApiType::X11;
+#[cfg(target_os = "windows")]
+const PREFERRED_API: clack_extensions::gui::GuiApiType<'static> =
+    clack_extensions::gui::GuiApiType::WIN32;
+
 impl PluginGuiImpl for ZfxMainThread<'_> {
     fn is_api_supported(&self, configuration: GuiConfiguration) -> bool {
-        let sup = !configuration.is_floating
-            && configuration.api_type == clack_extensions::gui::GuiApiType::X11;
+        let sup = !configuration.is_floating && configuration.api_type == PREFERRED_API;
         crate::scan_log(&format!(
             "is_api_supported: api_type={:?}, is_floating={}, ret={}",
             configuration.api_type, configuration.is_floating, sup
@@ -1337,7 +1595,7 @@ impl PluginGuiImpl for ZfxMainThread<'_> {
     fn get_preferred_api(&self) -> Option<GuiConfiguration<'_>> {
         crate::scan_log("get_preferred_api called");
         Some(GuiConfiguration {
-            api_type: clack_extensions::gui::GuiApiType::X11,
+            api_type: PREFERRED_API,
             is_floating: false,
         })
     }
@@ -1347,10 +1605,8 @@ impl PluginGuiImpl for ZfxMainThread<'_> {
             "create GUI: api_type={:?}, is_floating={}",
             configuration.api_type, configuration.is_floating
         ));
-        if configuration.is_floating
-            || configuration.api_type != clack_extensions::gui::GuiApiType::X11
-        {
-            return Err(PluginError::Message("Only embedded X11 GUI is supported"));
+        if configuration.is_floating || configuration.api_type != PREFERRED_API {
+            return Err(PluginError::Message("Unsupported GUI API configuration"));
         }
         Ok(())
     }
@@ -1401,9 +1657,13 @@ impl PluginGuiImpl for ZfxMainThread<'_> {
         }
 
         let clap_win = window.as_raw();
+        #[cfg(target_os = "linux")]
         // SAFETY: The host guarantees that `window` provides a valid X11 handle on Linux platforms.
-        let x11_window = unsafe { clap_win.specific.x11 };
-        let wrapper = ClapWindowWrapper(x11_window);
+        let raw_handle = unsafe { clap_win.specific.x11 };
+        #[cfg(target_os = "windows")]
+        // SAFETY: The host guarantees that `window` provides a valid Win32 HWND on Windows platforms.
+        let raw_handle = unsafe { clap_win.specific.win32 as usize as u64 };
+        let wrapper = ClapWindowWrapper(raw_handle);
 
         let (width, height) = get_window_size(self.shared.layout.as_ref());
 
@@ -1421,6 +1681,10 @@ impl PluginGuiImpl for ZfxMainThread<'_> {
             std::sync::Arc::clone(&self.shared.param_values),
             self.shared.params.clone(),
             std::sync::Arc::clone(&self.shared.gui_events),
+            #[cfg(feature = "feat_oversampling")]
+            std::sync::Arc::clone(&self.shared.oversampling_mode),
+            #[cfg(feature = "feat_oversampling")]
+            std::sync::Arc::clone(&self.shared.oversampling_phase),
         );
 
         match egui_baseview::EguiWindow::create(settings, app) {

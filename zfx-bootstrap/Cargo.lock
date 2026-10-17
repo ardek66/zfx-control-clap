@@ -3163,6 +3163,7 @@ name = "zfx-bootstrap"
 version = "0.1.0"
 dependencies = [
  "baseview",
+ "bitflags 2.13.2",
  "clack-common",
  "clack-extensions",
  "clack-plugin",
@@ -3176,6 +3177,8 @@ dependencies = [
  "quick-xml",
  "raw-window-handle",
  "serde",
+ "windows-sys 0.59.0",
+ "zerocopy",
 ]
 
 [[package]]
