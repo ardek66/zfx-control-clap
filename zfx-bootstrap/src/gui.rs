@@ -9,7 +9,7 @@ use crate::{EfxTypeInfo, GuiParamEvent, PluginParamDef, ZfxMainThread};
 use clack_extensions::gui::{GuiConfiguration, GuiSize, PluginGuiImpl, Window};
 use clack_plugin::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 struct ClapWindowWrapper(u64);
 
@@ -164,7 +164,7 @@ pub fn load_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egu
 
 pub struct ZfxApp {
     layout: Option<EfxTypeInfo>,
-    param_values: Arc<RwLock<HashMap<u32, f64>>>,
+    param_values: Arc<crate::params::ParamStore>,
     param_defs: HashMap<u32, PluginParamDef>,
     gui_events: Arc<Mutex<Vec<GuiParamEvent>>>,
     #[cfg(feature = "feat_oversampling")]
@@ -181,7 +181,7 @@ impl ZfxApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         layout: Option<EfxTypeInfo>,
-        param_values: Arc<RwLock<HashMap<u32, f64>>>,
+        param_values: Arc<crate::params::ParamStore>,
         param_defs_list: Vec<PluginParamDef>,
         gui_events: Arc<Mutex<Vec<GuiParamEvent>>>,
         #[cfg(feature = "feat_oversampling")] oversampling_mode: Arc<std::sync::atomic::AtomicU8>,
@@ -410,9 +410,7 @@ impl ZfxApp {
             if resp.clicked() && !is_selected {
                 let mode_val = f64::from(m.to_u8());
                 self.oversampling_mode.store(m.to_u8(), std::sync::atomic::Ordering::Release);
-                if let Ok(mut values) = self.param_values.write() {
-                    values.insert(crate::PARAM_OVERSAMPLING, mode_val);
-                }
+                let _ = self.param_values.set(crate::PARAM_OVERSAMPLING, mode_val);
                 if let Ok(mut evs) = self.gui_events.lock() {
                     evs.push(GuiParamEvent::BeginGesture(crate::PARAM_OVERSAMPLING));
                     evs.push(GuiParamEvent::SetValue(crate::PARAM_OVERSAMPLING, mode_val));
@@ -510,9 +508,7 @@ impl ZfxApp {
             if resp.clicked() && !is_selected {
                 let phase_val = f64::from(p.to_u8());
                 self.oversampling_phase.store(p.to_u8(), std::sync::atomic::Ordering::Release);
-                if let Ok(mut values) = self.param_values.write() {
-                    values.insert(crate::PARAM_OVERSAMPLING_METHOD, phase_val);
-                }
+                let _ = self.param_values.set(crate::PARAM_OVERSAMPLING_METHOD, phase_val);
                 if let Ok(mut evs) = self.gui_events.lock() {
                     evs.push(GuiParamEvent::BeginGesture(crate::PARAM_OVERSAMPLING_METHOD));
                     evs.push(GuiParamEvent::SetValue(crate::PARAM_OVERSAMPLING_METHOD, phase_val));
@@ -674,10 +670,7 @@ impl egui_baseview::App for ZfxApp {
             );
 
             // Bypass Button (prm = 0)
-            let cur_bypass = {
-                let values = self.param_values.read().unwrap();
-                values.get(&0).copied().unwrap_or(0.0)
-            };
+            let cur_bypass = self.param_values.get_or(0, 0.0);
             let is_bypassed = cur_bypass >= 0.5;
             let bypass_btn_rect =
                 egui::Rect::from_min_size(egui::pos2(win_w - 85.0, 13.0), egui::vec2(70.0, 24.0));
@@ -721,13 +714,10 @@ impl egui_baseview::App for ZfxApp {
             // Read parameters:
             // prm 1 = RoomSize (0..100)
             // prm 2 = Sideways / Position (0..100, default 50 = Center On-Axis)
-            let (cur_room, cur_sideways) = {
-                let values = self.param_values.read().unwrap();
-                (
-                    values.get(&1).copied().unwrap_or(0.0),
-                    values.get(&2).copied().unwrap_or(50.0),
-                )
-            };
+            let (cur_room, cur_sideways) = (
+                self.param_values.get_or(1, 0.0),
+                self.param_values.get_or(2, 50.0),
+            );
 
             // Stage Area: Speaker Cone & Horizontal Microphone Track
             let stage_rect =
@@ -1002,11 +992,8 @@ impl egui_baseview::App for ZfxApp {
                 egui::Color32::from_rgb(110, 115, 125),
             );
 
-            if !param_updates.is_empty() {
-                let mut values = self.param_values.write().unwrap();
-                for (id, val) in param_updates {
-                    values.insert(id, val);
-                }
+            for (id, val) in param_updates {
+                let _ = self.param_values.set(id, val);
             }
             if !new_gui_events.is_empty() {
                 let mut events_lock = self.gui_events.lock().unwrap();
@@ -1061,10 +1048,7 @@ impl egui_baseview::App for ZfxApp {
                     .unwrap_or("Parameter");
 
                 // Read current parameter value
-                let cur_val = {
-                    let values = self.param_values.read().unwrap();
-                    values.get(&prm).copied().unwrap_or(def_val)
-                };
+                let cur_val = self.param_values.get_or(prm, def_val);
                 let norm = ((cur_val - min_val) / (max_val - min_val)).clamp(0.0, 1.0);
 
                 let total_frames = *self
@@ -1590,11 +1574,8 @@ impl egui_baseview::App for ZfxApp {
             }
 
             // Apply parameter value updates
-            if !param_updates.is_empty() {
-                let mut values = self.param_values.write().unwrap();
-                for (id, val) in param_updates {
-                    values.insert(id, val);
-                }
+            for (id, val) in param_updates {
+                let _ = self.param_values.set(id, val);
             }
 
             // Dispatch gesture events to host output
@@ -1623,16 +1604,10 @@ const PREFERRED_API: clack_extensions::gui::GuiApiType<'static> =
 
 impl PluginGuiImpl for ZfxMainThread<'_> {
     fn is_api_supported(&self, configuration: GuiConfiguration) -> bool {
-        let sup = !configuration.is_floating && configuration.api_type == PREFERRED_API;
-        crate::scan_log(&format!(
-            "is_api_supported: api_type={:?}, is_floating={}, ret={}",
-            configuration.api_type, configuration.is_floating, sup
-        ));
-        sup
+        !configuration.is_floating && configuration.api_type == PREFERRED_API
     }
 
     fn get_preferred_api(&self) -> Option<GuiConfiguration<'_>> {
-        crate::scan_log("get_preferred_api called");
         Some(GuiConfiguration {
             api_type: PREFERRED_API,
             is_floating: false,
@@ -1640,10 +1615,6 @@ impl PluginGuiImpl for ZfxMainThread<'_> {
     }
 
     fn create(&self, configuration: GuiConfiguration) -> Result<(), PluginError> {
-        crate::scan_log(&format!(
-            "create GUI: api_type={:?}, is_floating={}",
-            configuration.api_type, configuration.is_floating
-        ));
         if configuration.is_floating || configuration.api_type != PREFERRED_API {
             return Err(PluginError::Message("Unsupported GUI API configuration"));
         }

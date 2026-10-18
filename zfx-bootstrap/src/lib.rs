@@ -6,6 +6,7 @@
 )]
 
 pub mod gui;
+pub mod params;
 pub mod protocol;
 #[cfg(feature = "feat_oversampling")]
 pub mod resampler;
@@ -29,17 +30,6 @@ use clack_extensions::audio_ports::{
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use std::io::{Read, Write};
 
-pub fn scan_log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/zfx_clap_scan.log")
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "[pid {}] {}", std::process::id(), msg);
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
 pub enum GuiParamEvent {
     BeginGesture(u32),
@@ -59,8 +49,7 @@ impl Plugin for ZfxBootstrapPlugin {
     type Shared<'a> = ZfxShared;
     type MainThread<'a> = ZfxMainThread<'a>;
 
-    fn declare_extensions(builder: &mut PluginExtensions<Self>, shared: Option<&Self::Shared<'_>>) {
-        scan_log(&format!("declare_extensions (shared={})", shared.is_some()));
+    fn declare_extensions(builder: &mut PluginExtensions<Self>, _shared: Option<&Self::Shared<'_>>) {
         builder.register::<clack_extensions::params::PluginParams>();
         builder.register::<clack_extensions::gui::PluginGui>();
         builder.register::<PluginAudioPorts>();
@@ -92,7 +81,7 @@ pub struct ZfxShared {
     pub job_handle: windows_sys::Win32::Foundation::HANDLE,
     pub layout: Option<EfxTypeInfo>,
     pub params: Vec<PluginParamDef>,
-    pub param_values: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<u32, f64>>>,
+    pub param_values: std::sync::Arc<params::ParamStore>,
     pub gui_events: std::sync::Arc<std::sync::Mutex<Vec<GuiParamEvent>>>,
     pub is_active: std::sync::atomic::AtomicBool,
     #[cfg(feature = "feat_oversampling")]
@@ -140,13 +129,12 @@ impl ZfxShared {
 
 // SAFETY: `bridge_ptr` points to POSIX shared memory synchronized across threads using atomic operations and futexes.
 unsafe impl Send for ZfxShared {}
-// SAFETY: Concurrent access to `ZfxShared` fields is guarded by atomic operations, Arc<RwLock>, and Arc<Mutex>.
+// SAFETY: Concurrent access to `ZfxShared` fields is guarded by atomic operations, Arc<ParamStore>, and Arc<Mutex>.
 unsafe impl Sync for ZfxShared {}
 impl PluginShared<'_> for ZfxShared {}
 
 impl Drop for ZfxShared {
     fn drop(&mut self) {
-        scan_log("ZfxShared drop called");
         if !self.bridge_ptr.is_null() {
             // SAFETY: `bridge_ptr` is verified non-null and was mapped to the size of ZfxSharedBridge.
             unsafe {
@@ -280,19 +268,13 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
     }
 
     fn get_value(&self, param_id: ClapId) -> Option<f64> {
-        self.shared
-            .param_values
-            .read()
-            .unwrap()
-            .get(&param_id.get())
-            .copied()
-            .or_else(|| {
-                self.shared
-                    .params
-                    .iter()
-                    .find(|p| p.id == param_id.get())
-                    .map(|p| p.default_value)
-            })
+        self.shared.param_values.get(param_id.get()).or_else(|| {
+            self.shared
+                .params
+                .iter()
+                .find(|p| p.id == param_id.get())
+                .map(|p| p.default_value)
+        })
     }
 
     fn value_to_text(
@@ -344,7 +326,6 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     fn flush(
         &self,
         input_parameter_changes: &InputEvents,
@@ -354,29 +335,24 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
         let mut new_os_mode: Option<resampler::OversamplingMode> = None;
         #[cfg(feature = "feat_oversampling")]
         let mut new_os_phase: Option<resampler::OversamplingPhase> = None;
-        {
-            let mut param_values = self.shared.param_values.write().unwrap();
-            for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
-                match event.as_core_event() {
-                    Some(CoreEventSpace::ParamValue(p)) => {
-                        p.param_id().map(|id| (id.get(), p.value()))
-                    }
-                    _ => None,
+        for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
+            match event.as_core_event() {
+                Some(CoreEventSpace::ParamValue(p)) => {
+                    p.param_id().map(|id| (id.get(), p.value()))
                 }
-            }) {
-                param_values.insert(id, val);
-                #[cfg(feature = "feat_oversampling")]
-                match id {
-                    PARAM_OVERSAMPLING => {
-                        new_os_mode =
-                            Some(resampler::OversamplingMode::from_u8(val.round() as u8));
-                    }
-                    PARAM_OVERSAMPLING_METHOD => {
-                        new_os_phase =
-                            Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
-                    }
-                    _ => {}
+                _ => None,
+            }
+        }) {
+            let _ = self.shared.param_values.set(id, val);
+            #[cfg(feature = "feat_oversampling")]
+            match id {
+                PARAM_OVERSAMPLING => {
+                    new_os_mode = Some(resampler::OversamplingMode::from_u8(val.round() as u8));
                 }
+                PARAM_OVERSAMPLING_METHOD => {
+                    new_os_phase = Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
+                }
+                _ => {}
             }
         }
         #[cfg(feature = "feat_oversampling")]
@@ -455,36 +431,24 @@ const _: () = assert!(std::mem::size_of::<ZfxStateV2Ext>() == 4);
 const _: () = assert!(std::mem::size_of::<ZfxStateParamEntry>() == 12);
 
 impl ZfxMainThread<'_> {
-    #[allow(clippy::significant_drop_tightening)]
-    fn apply_loaded_params(
-        &self,
-        loaded_entries: impl IntoIterator<Item = (u32, f64)>,
-    ) -> Result<(), PluginError> {
+    fn apply_loaded_params(&self, loaded_entries: impl IntoIterator<Item = (u32, f64)>) {
         #[cfg(feature = "feat_oversampling")]
         let mut new_os_mode: Option<resampler::OversamplingMode> = None;
         #[cfg(feature = "feat_oversampling")]
         let mut new_os_phase: Option<resampler::OversamplingPhase> = None;
-        {
-            let mut values = self
-                .shared
-                .param_values
-                .write()
-                .map_err(|_| PluginError::Message("Failed to write params"))?;
-            for (id, val) in loaded_entries {
-                values.insert(id, val);
-                #[cfg(feature = "feat_oversampling")]
-                match id {
-                    PARAM_OVERSAMPLING => {
-                        new_os_mode = Some(resampler::OversamplingMode::from_u8(val.round() as u8));
-                    }
-                    PARAM_OVERSAMPLING_METHOD => {
-                        new_os_phase =
-                            Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
-                    }
-                    _ => {}
+        for (id, val) in loaded_entries {
+            let _ = self.shared.param_values.set(id, val);
+            #[cfg(feature = "feat_oversampling")]
+            match id {
+                PARAM_OVERSAMPLING => {
+                    new_os_mode = Some(resampler::OversamplingMode::from_u8(val.round() as u8));
                 }
+                PARAM_OVERSAMPLING_METHOD => {
+                    new_os_phase = Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
+                }
+                _ => {}
             }
-        } // CRITICAL: Write guard `values` is dropped here BEFORE calling host_params.rescan!
+        }
 
         #[cfg(feature = "feat_oversampling")]
         match (new_os_mode, new_os_phase) {
@@ -506,21 +470,12 @@ impl ZfxMainThread<'_> {
                 clack_extensions::params::ParamRescanFlags::VALUES,
             );
         }
-
-        Ok(())
     }
 }
 
 impl PluginStateImpl for ZfxMainThread<'_> {
     fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
-        let mut sorted_entries: Vec<(u32, f64)> = {
-            let values = self
-                .shared
-                .param_values
-                .read()
-                .map_err(|_| PluginError::Message("Failed to read params"))?;
-            values.iter().map(|(&k, &v)| (k, v)).collect()
-        };
+        let mut sorted_entries = self.shared.param_values.snapshot();
         sorted_entries.sort_by_key(|&(k, _)| k);
 
         let count_u32 = u32::try_from(sorted_entries.len())
@@ -614,7 +569,8 @@ impl PluginStateImpl for ZfxMainThread<'_> {
             .read_exact(entries.as_mut_bytes())
             .map_err(|_| PluginError::Message("Truncated state stream"))?;
 
-        self.apply_loaded_params(entries.iter().map(|e| (e.id.get(), e.val.get())))
+        self.apply_loaded_params(entries.iter().map(|e| (e.id.get(), e.val.get())));
+        Ok(())
     }
 }
 
@@ -792,7 +748,6 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
         input_parameter_changes: &InputEvents,
         output_parameter_changes: &mut OutputEvents,
     ) {
-        let mut param_values = self.shared.param_values.write().unwrap();
         for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
             match event.as_core_event() {
                 Some(CoreEventSpace::ParamValue(p)) => {
@@ -801,7 +756,7 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
                 _ => None,
             }
         }) {
-            param_values.insert(id, val);
+            let _ = self.shared.param_values.set(id, val);
             #[cfg(feature = "feat_oversampling")]
             match id {
                 PARAM_OVERSAMPLING => {
@@ -826,7 +781,7 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
                     PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
                     _ => {}
                 }
-                if let Some(&val) = param_values.get(&param.id) {
+                if let Some(val) = self.shared.param_values.get(param.id) {
                     let range = param.max_value - param.min_value;
                     let norm = if range > 0.0 {
                         ((val - param.min_value) / range).clamp(0.0, 1.0) as f32
@@ -1028,7 +983,6 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
 
         // 1. Process parameter automation changes
         {
-            let mut param_values = self.shared.param_values.write().unwrap();
             for (id, val) in events.input.into_iter().filter_map(|event| {
                 match event.as_core_event() {
                     Some(CoreEventSpace::ParamValue(p)) => {
@@ -1037,7 +991,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                     _ => None,
                 }
             }) {
-                param_values.insert(id, val);
+                let _ = self.shared.param_values.set(id, val);
                 #[cfg(feature = "feat_oversampling")]
                 match id {
                     PARAM_OVERSAMPLING => {
@@ -1060,7 +1014,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                     PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
                     _ => {}
                 }
-                if let Some(&val) = param_values.get(&param.id) {
+                if let Some(val) = self.shared.param_values.get(param.id) {
                     let range = param.max_value - param.min_value;
                     let norm = if range > 0.0 {
                         ((val - param.min_value) / range).clamp(0.0, 1.0) as f32
@@ -1093,27 +1047,22 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         }
 
         // Determine whether plugin is currently bypassed via prm 0
-        let is_bypassed = self
-            .shared
-            .param_values
-            .read()
-            .unwrap()
-            .get(&0)
-            .copied()
-            .is_some_and(|val| {
-                self.shared
-                    .params
-                    .iter()
-                    .find(|p| p.id == 0)
-                    .is_some_and(|param| {
-                        let name_lower = param.name.to_lowercase();
-                        match () {
-                            () if name_lower.contains("bypass") => val >= 50.0 || val >= 0.5,
-                            () if name_lower.contains("on/off") || name_lower.contains("power") => val < 50.0,
-                            () => false,
+        let is_bypassed = self.shared.param_values.get(0).is_some_and(|val| {
+            self.shared
+                .params
+                .iter()
+                .find(|p| p.id == 0)
+                .is_some_and(|param| {
+                    let name_lower = param.name.to_lowercase();
+                    match () {
+                        () if name_lower.contains("bypass") => val >= 50.0 || val >= 0.5,
+                        () if name_lower.contains("on/off") || name_lower.contains("power") => {
+                            val < 50.0
                         }
-                    })
-            });
+                        () => false,
+                    }
+                })
+        });
 
         // 2. Audio processing through Zoom ZFX 32-bit DSP companion
         for mut port_pair in &mut audio {
@@ -1176,7 +1125,6 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         }
                     }
                 }
-
                 if is_bypassed {
                     // True Software Passthrough: Bit-exact dry audio when bypassed
                     for (ch, pair) in pairs[..num_pairs].iter_mut().enumerate() {
@@ -1387,6 +1335,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                                 };
                             }
                         }
+
                     }
                 }
 
@@ -1456,9 +1405,6 @@ clack_export_entry!(SinglePluginEntry<ZfxBootstrapPlugin>);
 
 impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
     fn get_descriptor() -> PluginDescriptor {
-        scan_log(&format!(
-            "get_descriptor called: id={PLUGIN_ID}, name={PLUGIN_NAME}"
-        ));
         PluginDescriptor::new(PLUGIN_ID, PLUGIN_NAME)
             .with_vendor("ZFX Porting Project")
             .with_features(PLUGIN_FEATURES.iter().copied())
@@ -1466,13 +1412,10 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
 
     #[allow(clippy::too_many_lines)]
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
-        scan_log(&format!("new_shared start: id={PLUGIN_ID}"));
         if EMBEDDED_WORKER_PAYLOAD.is_empty() {
-            scan_log("new_shared ERR: worker payload empty");
             return Err(PluginError::Message("Embedded worker payload is empty"));
         }
         if EMBEDDED_DLL_PAYLOAD.is_empty() {
-            scan_log("new_shared ERR: dll payload empty");
             return Err(PluginError::Message("Embedded DLL payload is empty"));
         }
 
@@ -1679,22 +1622,19 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             let needs_write = std::fs::metadata(&worker_path).map_or(true, |meta| {
                 meta.len() != EMBEDDED_WORKER_PAYLOAD.len() as u64
             });
-            if needs_write {
-                if let Err(e) = std::fs::write(&worker_path, EMBEDDED_WORKER_PAYLOAD) {
-                    scan_log(&format!("Failed to write worker binary: {e}"));
-                    // SAFETY: Unmapping shared memory view and closing file mapping handle on payload write failure.
-                    unsafe {
-                        windows_sys::Win32::System::Memory::UnmapViewOfFile(
-                            windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-                                Value: bridge_addr,
-                            },
-                        );
-                        CloseHandle(h_map);
-                    }
-                    return Err(PluginError::Message(
-                        "Failed to write worker binary to temp dir",
-                    ));
+            if needs_write && std::fs::write(&worker_path, EMBEDDED_WORKER_PAYLOAD).is_err() {
+                // SAFETY: Unmapping shared memory view and closing file mapping handle on payload write failure.
+                unsafe {
+                    windows_sys::Win32::System::Memory::UnmapViewOfFile(
+                        windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                            Value: bridge_addr,
+                        },
+                    );
+                    CloseHandle(h_map);
                 }
+                return Err(PluginError::Message(
+                    "Failed to write worker binary to temp dir",
+                ));
             }
 
             // SAFETY: Creating Win32 job object to supervise child worker process.
@@ -1783,7 +1723,6 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             }
         }
         if !ready {
-            scan_log("new_shared ERR: Timeout waiting for zfx-worker32 ready");
             #[cfg(target_os = "linux")]
             // SAFETY: Cleaning up worker process and bridge resources on ready timeout.
             unsafe {
@@ -1841,7 +1780,6 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             }
         }
         if !init_ok {
-            scan_log("new_shared ERR: zfx-worker32 failed CMD_INIT");
             #[cfg(target_os = "linux")]
             // SAFETY: Terminating failed worker and cleaning up shared memory.
             unsafe {
@@ -1983,15 +1921,6 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             });
         }
 
-        let initial_param_values: std::collections::HashMap<u32, f64> =
-            params.iter().map(|p| (p.id, p.default_value)).collect();
-
-        scan_log(&format!(
-            "new_shared OK: id={}, params={}",
-            PLUGIN_ID,
-            params.len()
-        ));
-
         Ok(ZfxShared {
             bridge_ptr: bridge_addr.cast::<protocol::ZfxSharedBridge>(),
             #[cfg(target_os = "linux")]
@@ -2005,8 +1934,8 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             #[cfg(target_os = "windows")]
             job_handle,
             layout,
+            param_values: params::ParamStore::new(params.iter().map(|p| (p.id, p.default_value))),
             params,
-            param_values: std::sync::Arc::new(std::sync::RwLock::new(initial_param_values)),
             gui_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             is_active: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "feat_oversampling")]
@@ -2024,7 +1953,6 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
         host: HostMainThreadHandle<'a>,
         shared: &'a Self::Shared<'a>,
     ) -> Result<Self::MainThread<'a>, PluginError> {
-        scan_log(&format!("new_main_thread for {PLUGIN_ID}"));
         Ok(ZfxMainThread {
             shared,
             host,
@@ -2163,3 +2091,5 @@ mod tests {
         assert_eq!(parsed_entries[2].val.get(), 1.0);
     }
 }
+
+
