@@ -218,9 +218,51 @@ const _: () = assert!(std::mem::size_of::<ZfxInterfaceWrapper>() == 8);
 ```
 Slot 1 points to the true Steinberg VST 2.4 `AEffect` struct with magic `0x56737450` (`'VstP'`).
 
-### 2.4 C++ Object Models: 5th-Order Filters and Resonators
+### 2.4 Reverse-Engineered C++ DSP Core Object Model & Sub-Objects
 
-#### 5th-Order Speaker Cabinet / Tone Filter Sub-Object
+The VST 2.4 `AEffect` instance returned by `getinterface` contains a pointer to the internal C++ DSP core engine at `(*effect).object` (`this` pointer). Reverse-engineering of the memory space across all 86 DLLs reveals a consistent, object-oriented DSP architecture.
+
+#### 1. DSP Core Virtual Method Table (VTable Layout)
+All audio-processing objects inherit from a base DSP core with the following critical virtual function slots:
+
+| VTable Slot | Method Signature (`__thiscall`) | RVA (Tangerine) | Architectural Role |
+| :--- | :--- | :--- | :--- |
+| `vtable[0..5]` | Internal lifecycle / parameter accessors | — | Destructor, parameter getters/setters, state serialization |
+| `vtable[6]` | `void setSampleRate(float sr)` | `0x10007b64` | Dispatches 44.1k vs 48.0k filter coefficient table reload |
+| `vtable[7]` | `void setBlockSize(int blockSize)` | `0x10001430` | Resizes internal audio block buffers |
+| `vtable[8]` | `void reset()` | `0x10001200` | Clears recursive filter histories and delay line rings |
+| `vtable[9]` | `void processDoubleReplacing(double** in, double** out, int frames)` | `0x10006040` | **Primary 64-bit double-precision DSP processing loop** |
+
+Invocation from the modern 32-bit worker (`peldr.rs`) uses explicit x86 inline assembly respecting the Microsoft Visual C++ `__thiscall` ABI (`ecx = this` pointer, arguments pushed right-to-left, callee cleans stack):
+```rust
+let obj = (*self.effect).object.cast::<*mut usize>();
+let vtable = *obj;
+let dsp_proc_fn = *vtable.add(9);
+std::arch::asm!(
+    "push {frames}",
+    "push {outs}",
+    "push {ins}",
+    "call {proc}",
+    frames = in(reg) sample_frames,
+    outs = in(reg) outputs,
+    ins = in(reg) inputs,
+    proc = in(reg) dsp_proc_fn,
+    in("ecx") obj,
+    clobber_abi("C"),
+);
+```
+
+#### 2. DSP Core Internal State & Probed Memory Fields
+Dynamic probing via `MemoryView` across `0x00..0x300` bytes of the heap object reveals dedicated internal state variables:
+- **Sample Rate Fields**:
+  - `sr_f64_offset` (`0x40..0x2f8`): 64-bit float IEEE 754 representation of active sample rate (`44100.0` vs `48000.0`).
+  - `sr_i32_offset` (`0x40..0x2fc`): 32-bit signed integer representation (`44100` vs `48000`).
+- **Acoustic Cabinet Reflection Delay Line**:
+  - `comb_len_offset` (`0x200..0x2a0`): Buffer capacity / delay tap length ($N \le 1000$ samples at 48k).
+  - `comb_buf_offset`: Heap pointer to the circular delay memory.
+  - `feedback_gain`: Scalar reflection coefficient ($g \in [0.5, 0.99]$).
+
+#### 3. 5th-Order Speaker Cabinet / Tone Filter Sub-Object (`Order5SubObject`)
 Zoom cabinets and high-gain amps employ 5th-order IIR filters represented by 88 bytes of coefficients and internal history delay lines:
 
 ```rust
@@ -246,7 +288,22 @@ pub struct Order5SubObject {
 const _: () = assert!(std::mem::size_of::<Order5SubObject>() == 0x40 + 88);
 ```
 
-#### Wah / SVF Resonator Parameter Block
+#### 4. Direct Form II Transposed Biquad Filter (`BiquadCoeffs`)
+Tone stack EQ sections (Bass, Middle, Treble, Presence) and input high-pass pre-filters are implemented as cascades of Direct Form II transposed biquads:
+```rust
+/// Direct Form II Transposed Biquad Filter (40 bytes).
+/// - Feedforward zeros: b[0..3] (24 bytes)
+/// - Feedback poles: a[0..2] (16 bytes, stored as positive feedback values +a1, +a2)
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct BiquadCoeffs {
+    pub b: [f64; 3],
+    pub a: [f64; 2],
+}
+const _: () = assert!(std::mem::size_of::<BiquadCoeffs>() == 40);
+```
+
+#### 5. Wah / SVF Resonator Parameter Block (`WahResonatorParams`)
 Zoom wah pedals (`Pedal_Cry`, `Wah100`) house state-variable resonators at sub-objects:
 ```rust
 /// Typed sub-object representation for Zoom Wah / SVF Resonators (24 bytes).
@@ -380,6 +437,61 @@ Zoom ZFX cabinets utilize **Infinite Impulse Response (IIR) Physical Modeling**:
 - 5th-order transfer functions with **strict numerator symmetry**:
   $$b_0 = b_5, \quad b_1 = b_4, \quad b_2 = b_3$$
 - Generates steep, analog-authentic acoustic roll-offs (approximating air absorption, speaker cone inertia, and voice coil inductance) with **zero latency** and **instantaneous transient punch**.
+
+### 4.4 Block-Oriented Nonlinear Architecture: Cascaded Wiener-Hammerstein Modeling
+
+A central reverse-engineering discovery of the Zoom ZFX signal processing loop is that its distortion and filtering stages do not implement coupled state-space equations (such as Wave Digital Filters or SPICE-like Modified Nodal Analysis). Instead, they are strictly structured as **Block-Oriented Nonlinear Systems**:
+
+```
+                              Zoom ZFX Amplifier Signal Chain
+                               (Cascaded Wiener-Hammerstein)
+
+     ┌─────────────────────── WIENER STAGE ───────────────────────┐
+     │                                                            │
+x[n] ──► [Input High-Pass / Pre-EQ] ──► [Preamp Waveshaping NL]  ──┤
+           H_pre(z) (Biquad/1st-order)     f_pre(x) = atan(α·x)   │
+                                                                  ▼
+     ┌───────────────────── HAMMERSTEIN STAGE ────────────────────┐
+     │                                                            │
+     ├──► [Cathode Coupling / Tone Stack] ──► [Power Amp NL] ──────┤
+            H_tone(z) (Biquad Cascade)        f_pwr(x) = tanh(x)  │
+                                                                  ▼
+     ┌───────────────── TERMINAL HAMMERSTEIN CAB ─────────────────┐
+     │                                                            │
+y[n] ◄── [Comb Delay Line] ◄── [5th-Order Speaker Cabinet IIR] ───┘
+          Enclosure Reflections      H_cab(z) (Order5SubObject)
+```
+
+#### 1. Theoretical Definitions
+In classical nonlinear system identification:
+- **Wiener Model ($L \to NL$)**: A linear dynamic filter $H(z)$ precedes a static memoryless nonlinearity $f(\cdot)$:
+  $$v[n] = (h * x)[n] = \sum_{k=0}^{\infty} h[k] x[n-k], \quad y[n] = f(v[n])$$
+  *Physical Role*: Dictates **frequency-dependent saturation** (e.g. bass roll-off preventing low-frequency intermodulation, or bright cap treble boosts driving a tube grid into early overdrive).
+- **Hammerstein Model ($NL \to L$)**: A static memoryless nonlinearity $f(\cdot)$ precedes a linear dynamic filter $H(z)$:
+  $$v[n] = f(x[n]), \quad y[n] = (h * v)[n] = \sum_{k=0}^{\infty} h[k] v[n-k]$$
+  *Physical Role*: Dictates **harmonic reconstruction and acoustic radiation** (e.g. raw, harsh square/trapezoidal harmonics from clipping diodes or power tubes exciting the physical mass inertia and voice-coil inductance of a speaker cone).
+- **Wiener-Hammerstein Model ($L_1 \to NL \to L_2$)**: The composite sandwich model combining pre-emphasis, saturation, and post-filtering:
+  $$y[n] = \sum_{k=0}^{\infty} h_2[k] \cdot f\left(\sum_{m=0}^{\infty} h_1[m] x[n - k - m]\right)$$
+
+#### 2. Signal Path Deconstruction in Zoom ZFX
+Disassembly of `processDoubleReplacing` reveals this block cascade in concrete code:
+
+1. **Preamp Drive Stage (Wiener Block $H_{\text{pre}} \to f_{\text{pre}}$)**:
+   - Guitar pickup direct signals carry massive sub-bass energy ($< 80\text{ Hz}$). If fed unattenuated into a clipping function, the low-frequency fundamentals dominate the waveform, causing severe intermodulation distortion ("blocking distortion").
+   - Zoom implements an input Direct Form II high-pass/shelving biquad $H_{\text{pre}}(z)$ to shape the spectrum before saturation. The shaped signal is scaled by `Gain` and evaluated in closed form via `__libm_sse2_atan` or rational polynomials.
+2. **Inter-Stage & Tone Stack (Hammerstein Post-Filter & Next-Stage Wiener Pre-Filter)**:
+   - The rich harmonic spectrum generated by $f_{\text{pre}}(x)$ passes into the 3-band tone stack (Bass, Middle, Treble) implemented as a series of 2nd-order biquad IIR filters $H_{\text{tone}}(z)$.
+   - This block functions simultaneously as a **Hammerstein post-filter** (smoothing the preamp clipping) and a **Wiener pre-filter** (shaping the spectral balance feeding the power stage).
+3. **Power Stage & Speaker Cabinet (Terminal Hammerstein Block $f_{\text{pwr}} \to H_{\text{cab}}$)**:
+   - The master output drives a push-pull saturation function $f_{\text{pwr}}(x) = \tanh(x)$.
+   - The heavily saturated waveform directly excites the **5th-Order Cabinet IIR Filter** ([`Order5SubObject`](file:///home/idf/dev/c51t/zfx-worker32/src/dsp_layout.rs#L27-L35)).
+   - The 5th-order filter transfer function features **strict numerator mirror symmetry** ($b_0 = b_5, b_1 = b_4, b_2 = b_3$), providing symmetric transmission zeros that produce an analog-matched 30 dB/octave physical acoustic roll-off.
+
+#### 3. Why Zoom Chose Block Nonlinearity Over Physical State-Space / WDF
+- **Computational Determinism ($O(1)$ Inner Loop)**: In 2007–2008, implicit numerical ODE integration (e.g., trapezoidal integration with Newton-Raphson solvers for nonlinear diode/triode algebraic loops in Wave Digital Filters) was computationally prohibitive for multi-instance real-time audio on single-core Pentium 4 CPUs.
+- **Decoupled States**: Block decomposition completely decouples the recursive filter states ($w[n]$) from the nonlinear evaluation ($f(x)$). The IIR filters run via standard multiply-accumulate operations, and the waveshapers evaluate via vectorized SIMD transcendentals in closed form—with zero convergence risk and zero iterative overhead.
+- **Acoustic Transient Immediacy**: Because the Hammerstein cabinet stage is a recursive IIR filter rather than a 2048-sample FIR convolution IR, it introduces **zero algorithmic latency**, preserving the instantaneous percussive "snap" of the guitar pick attack.
+- **Root Cause of the Sample-Rate Bug**: Because each linear block in the Wiener-Hammerstein chain was precomputed for $T_s = \frac{1}{44100}$ or $\frac{1}{48000}$, running at 96 kHz warped the discrete poles $z_p = e^{s_p T_s}$. This destroyed the delicate balance between the Wiener pre-emphasis and the Hammerstein cabinet cutoff, creating the infamous +14.4 dB treble leak and muddy bass response.
 
 ---
 

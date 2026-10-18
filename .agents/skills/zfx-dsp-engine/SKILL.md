@@ -19,23 +19,31 @@ The Zoom ZFX DSP engine consists of over 60 dedicated guitar effect, amplifier, 
 
 ```
                               Zoom ZFX DSP Signal Flow
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                        │
-│   Input Audio ──► [Input High-Pass] ──► [Nonlinear Waveshaper] ──► [Tone Stack Biquads]│
-│   (64-bit f64)       (DC Cutoff)          (atan / exp / tanh)        (Direct Form I/II)│
-│                                                                          │             │
-│   Output Audio ◄── [Master Level] ◄── [Speaker Cabinet EQ] ◄─────────────┘             │
-│   (64-bit f64)        (Scaling)         (Comb Delay + IIR)                             │
-│                                                                                        │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+                               (Cascaded Wiener-Hammerstein)
+
+     ┌─────────────────────── WIENER STAGE ───────────────────────┐
+     │                                                            │
+x[n] ──► [Input High-Pass / Pre-EQ] ──► [Preamp Waveshaping NL]  ──┤
+           H_pre(z) (Biquad/1st-order)     f_pre(x) = atan(α·x)   │
+                                                                  ▼
+     ┌───────────────────── HAMMERSTEIN STAGE ────────────────────┐
+     │                                                            │
+     ├──► [Cathode Coupling / Tone Stack] ──► [Power Amp NL] ──────┤
+            H_tone(z) (Biquad Cascade)        f_pwr(x) = tanh(x)  │
+                                                                  ▼
+     ┌───────────────── TERMINAL HAMMERSTEIN CAB ─────────────────┐
+     │                                                            │
+y[n] ◄── [Comb Delay Line] ◄── [5th-Order Speaker Cabinet IIR] ───┘
+          Enclosure Reflections      H_cab(z) (Order5SubObject)
 ```
 
 ### Core Architectural Truths:
-1. **Internal Precision**: All DSP processing callbacks operate in **native 64-bit IEEE 754 double precision (`f64`)** via VST 2.4 `processDoubleReplacing`.
-2. **Sample-Rate Paradigm**: The internal DSP algorithms and filter coefficient tables are **strictly hardcoded for dual-rate operation: 44.1 kHz and 48.0 kHz**.
-3. **The High-Rate Fallback Trap**: At sample rates $\ge 88.2\text{ kHz}$ (e.g., 96 kHz or 192 kHz), the plugins do not reject the host rate, but their IIR filter cutoffs fall back to the 44.1 kHz coefficient table, shifting all filter corner frequencies upwards by $\frac{f_s}{44100} \approx 2.18\times$.
-4. **Aliasing**: The nonlinear clipping stages generate high-order harmonics without internal oversampling, creating audible Nyquist foldback at 44.1 kHz.
-5. **Phase Preservation Requirement**: Preserving linear phase during oversampling is mandatory when blending multiple microphones in parallel (e.g., in-axis Dynamic 57 + off-axis Dynamic 421) to prevent destructive comb filtering.
+1. **Block-Oriented Nonlinear Topology**: Implements a **Cascaded Wiener-Hammerstein Network** ($L_1 \to NL_1 \to L_2 \to NL_2 \to L_3$). Filter states are strictly decoupled from memoryless transcendental waveshapers, yielding deterministic $O(1)$ computation per sample frame.
+2. **Internal Precision**: All DSP processing callbacks operate in **native 64-bit IEEE 754 double precision (`f64`)** via VST 2.4 `processDoubleReplacing` at `vtable[9]`.
+3. **Sample-Rate Paradigm**: The internal DSP algorithms and filter coefficient tables are **strictly hardcoded for dual-rate operation: 44.1 kHz and 48.0 kHz**.
+4. **The High-Rate Fallback Trap**: At sample rates $\ge 88.2\text{ kHz}$ (e.g., 96 kHz or 192 kHz), the plugins do not reject the host rate, but their IIR filter cutoffs fall back to the 44.1 kHz coefficient table, shifting all filter corner frequencies upwards by $\frac{f_s}{44100} \approx 2.18\times$ and destroying the Wiener-Hammerstein frequency-dependent drive balance.
+5. **Aliasing**: The nonlinear clipping stages generate high-order harmonics without internal oversampling, creating audible Nyquist foldback at 44.1 kHz.
+6. **Phase Preservation Requirement**: Preserving linear phase during oversampling is mandatory when blending multiple microphones in parallel (e.g., in-axis Dynamic 57 + off-axis Dynamic 421) to prevent destructive comb filtering.
 
 ---
 
@@ -53,7 +61,25 @@ The Zoom ZFX DSP engine consists of over 60 dedicated guitar effect, amplifier, 
   - Prevents limit-cycle oscillations during silent passages or long reverb/delay tails.
   - Leaves ample headroom for massive low-end boosting without register saturation.
 
-### 2.2 Denormal Float Protection (SSE FTZ / DAZ)
+### 2.2 Reverse-Engineered C++ DSP Core Object Memory Map
+The C++ DSP core object (`(*effect).object`) exhibits a standardized memory layout across all 86 plugins:
+- `0x00`: Pointer to virtual method table (VTable).
+  - `vtable[6]`: `void setSampleRate(float sr)` (`__thiscall` with `ecx = this`).
+  - `vtable[7]`: `void setBlockSize(int bs)` (`__thiscall` with `ecx = this`).
+  - `vtable[8]`: `void reset()` (clears recursive filter delay states).
+  - `vtable[9]`: `void processDoubleReplacing(double** in, double** out, int frames)`.
+- `0x40..0x2f8`: `sr_f64_offset` (active sample rate as IEEE 754 `f64`).
+- `0x40..0x2fc`: `sr_i32_offset` (active sample rate as signed integer `i32`).
+- `0x180..0x260`: `order5_offset` pointing to `Order5SubObject`:
+  - `+0x00`: VTable pointer.
+  - `+0x04..0x3C`: 7 `f64` delay line history states (56 bytes).
+  - `+0x40..0x98`: 88-byte `Order5Coeffs` (40 bytes positive feedback poles $A_1..A_5$, 48 bytes symmetric numerator zeros $B_0..B_5$).
+- `0x200..0x2a0`: Reflection comb filter descriptor:
+  - `len_offset`: Delay length ($N \le 1000$ samples at 48k).
+  - `buf_offset`: Heap buffer pointer for circular delay line.
+  - `feedback_gain`: Enclosure reflection damping coefficient ($g \in [0.5, 0.99]$).
+
+### 2.3 Denormal Float Protection (SSE FTZ / DAZ)
 To protect against x86 CPU performance degradation caused by IEEE 754 denormal floats in recursive filter tails:
 * `Win32ContextGuard` enforces SSE control register flags:
   ```rust
@@ -66,7 +92,18 @@ To protect against x86 CPU performance degradation caused by IEEE 754 denormal f
 
 ## 3. Nonlinear Saturation & Harmonic Aliasing Analysis
 
-### 3.1 Saturation Functions
+### 3.1 Block-Oriented Decomposition: Wiener vs. Hammerstein Stages
+1. **Wiener Pre-Filter ($H_{\text{pre}}(z) \to f_{\text{pre}}(x)$)**:
+   - High-pass and shelving biquads roll off sub-bass rumble ($< 80\text{ Hz}$) before the nonlinear clipping stage.
+   - Prevents blocking distortion and intermodulation between heavy bass transients and high-string harmonics.
+2. **Harmonic Inter-Stage ($f_{\text{pre}}(x) \to H_{\text{tone}}(z)$)**:
+   - The rich harmonic spectrum generated by $f_{\text{pre}}$ directly excites the passive biquad tone stack (Bass, Mid, Treble).
+   - Functions as a Hammerstein smoothing filter for the preamp, and simultaneously as a Wiener pre-emphasis filter for the power stage.
+3. **Terminal Hammerstein Cabinet ($f_{\text{pwr}}(x) \to H_{\text{cab}}(z)$)**:
+   - Power amp push-pull saturation ($\tanh(x)$) feeds directly into the 5th-order cabinet IIR filter.
+   - Acts as the linear acoustic reconstruction stage modeling speaker cone inertia and inductive voice-coil attenuation.
+
+### 3.2 Saturation Functions
 Zoom ZFX amplifier heads (`Tangerine`, `1959`, `MS_Crunch`, `DZ_Bert`, `MB_Dual_Head`, `PV_STACK`) and distortion pedals (`FUZZ_SMILE`, `GREAT_MUFF`, `TubeScreamen`, `SQUEAK`) model tube grids and clipping diodes using mathematical transcendental functions:
 * `__libm_sse2_atan(x)`: Smooth, symmetrical saturation characteristic of soft-clipping overdrive and triode grid conduction.
 * `__libm_sse2_exp(x)`: Exponential diode conduction equations:
@@ -74,7 +111,7 @@ Zoom ZFX amplifier heads (`Tangerine`, `1959`, `MS_Crunch`, `DZ_Bert`, `MB_Dual_
 * `__libm_sse2_tanh(x)`: Symmetric differential amplifier saturation.
 * Polynomial approximations: Asymmetric rational polynomials modeling cathode bypass biasing and duty-cycle modulation.
 
-### 3.2 Harmonic Generation & Aliasing Foldback
+### 3.3 Harmonic Generation & Aliasing Foldback
 When an analog tube stage clips, it generates infinite harmonics that roll off naturally into radio frequencies. In a discrete digital system:
 * Any harmonic generated above the Nyquist frequency ($f_N = \frac{f_s}{2}$) reflects back into the audible baseband:
   $$f_{\text{alias}} = |f_{\text{harmonic}} - k \cdot f_s|$$
@@ -89,14 +126,18 @@ When an analog tube stage clips, it generates infinite harmonics that roll off n
 ## 4. Filter Topologies & Tone Stacks
 
 ### 4.1 Tone Stack Biquad Filters
-Tone controls (Bass, Middle, Treble, Presence) are modeled using 2nd-order Direct Form IIR biquad filters:
-$$H(z) = \frac{b_0 + b_1 z^{-1} + b_2 z^{-2}}{1 + a_1 z^{-1} + a_2 z^{-2}}$$
+Tone controls (Bass, Middle, Treble, Presence) are modeled using 2nd-order Direct Form II transposed IIR biquad filters:
+$$H(z) = \frac{b_0 + b_1 z^{-1} + b_2 z^{-2}}{1 - (a_1 z^{-1} + a_2 z^{-2})}$$
 
-### 4.2 Cabinet Speaker Simulation
+### 4.2 Cabinet Speaker Simulation (5th-Order IIR + Comb Delay)
 Cabinets do not use simple static impulse response convolutions. They employ a hybrid architecture:
 1. **Multi-Tap Reflection Comb Delay**: Models internal cabinet enclosure resonances and speaker baffle reflection delays. The delay buffer dynamically scales with sample rate:
    $$\text{Buffer Size} = 40 \times f_s\text{ bytes}$$
-2. **Fixed-Coefficient Biquad Cascades**: Models speaker cone mass roll-off and voice coil inductance (steep attenuation above 5–6 kHz).
+2. **5th-Order IIR Physical Transfer Function**:
+   - Transfer function:
+     $$H_{\text{cab}}(z) = \frac{\sum_{k=0}^5 b_k z^{-k}}{1 - \sum_{k=1}^5 A_k z^{-k}}$$
+   - **Numerator Mirror Symmetry**: $b_0 = b_5, b_1 = b_4, b_2 = b_3$.
+   - Delivers steep $30\text{ dB/octave}$ acoustic roll-off with **zero algorithmic latency** and zero transient smearing.
 
 ---
 
