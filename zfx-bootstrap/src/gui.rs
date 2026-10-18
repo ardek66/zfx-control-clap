@@ -135,17 +135,21 @@ pub fn find_frame_asset(base: &str, index: usize) -> Option<&'static [u8]> {
 
 #[must_use]
 pub fn probe_frame_count(base: &str, declared_max: Option<u32>) -> usize {
-    if let Some(m) = declared_max {
-        if m > 0 {
-            return m as usize;
-        }
-    }
-
     let count = (0..256)
         .take_while(|&count| find_frame_asset(base, count).is_some())
         .count();
 
-    count.max(1)
+    if count > 0 {
+        count
+    } else if let Some(m) = declared_max {
+        if m > 0 {
+            (m + 1) as usize
+        } else {
+            1
+        }
+    } else {
+        1
+    }
 }
 
 #[must_use]
@@ -1033,7 +1037,17 @@ impl egui_baseview::App for ZfxApp {
             let mut param_updates: Vec<(u32, f64)> = Vec::new();
             let mut new_gui_events: Vec<GuiParamEvent> = Vec::new();
 
-            for ctrl in &ctrls.ctrl {
+            // Sort controls so discrete click targets (buttons, toggles, switches)
+            // are evaluated before larger overlapping bounding boxes (knobs, faders).
+            // This guarantees that buttons with precise hit targets take click precedence
+            // over the transparent corner margins of adjacent circular knobs.
+            let mut sorted_ctrls: Vec<&crate::Ctrl> = ctrls.ctrl.iter().collect();
+            sorted_ctrls.sort_by_key(|c| match c.type_tag.as_str() {
+                "PushKey" | "Toggle" | "ImgKey" | "Tap" | "IncKey" | "NInputKey" => 0,
+                _ => 1,
+            });
+
+            for ctrl in sorted_ctrls {
                 let prm = ctrl.prm;
                 let prm_def = self.param_defs.get(&prm);
                 let min_val = prm_def.map_or(0.0, |p| p.min_value);
@@ -1265,6 +1279,7 @@ impl egui_baseview::App for ZfxApp {
                             ui.allocate_rect(ctrl_rect, egui::Sense::hover())
                         } else {
                             ui.allocate_rect(ctrl_rect, egui::Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                         };
 
                         let is_on = ctrl.param_of_index.map_or_else(
@@ -1275,8 +1290,26 @@ impl egui_baseview::App for ZfxApp {
                         if !is_sub && response.clicked() {
                             let new_val = ctrl.param_of_index.map_or_else(
                                 || if is_on { min_val } else { max_val },
-                                f64::from,
+                                |target_idx| {
+                                    // For a 2-state parameter (e.g. Rhythm vs Lead, min 0 max 1):
+                                    // If already active and clicked, toggle to the opposite channel.
+                                    // If inactive and clicked, activate this channel.
+                                    if (max_val - min_val - 1.0).abs() < 1e-4 {
+                                        if is_on {
+                                            if target_idx == 0 {
+                                                max_val
+                                            } else {
+                                                min_val
+                                            }
+                                        } else {
+                                            f64::from(target_idx)
+                                        }
+                                    } else {
+                                        f64::from(target_idx)
+                                    }
+                                },
                             );
+                            let _ = self.param_values.set(prm, new_val);
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, new_val));
                             new_gui_events.push(GuiParamEvent::SetValue(prm, new_val));
@@ -1289,15 +1322,17 @@ impl egui_baseview::App for ZfxApp {
                             _ => frame_idx,
                         };
 
-                        response.on_hover_ui(|ui| {
-                            let status = match (ctrl.param_of_index.is_some(), is_on) {
-                                (true, true) => "Selected",
-                                (true, false) => "Inactive",
-                                (false, true) => "ON",
-                                (false, false) => "OFF",
-                            };
-                            ui.label(format!("{param_name}: {status}"));
-                        });
+                        if ctrl.disable_tool_tip != Some(1) {
+                            response.on_hover_ui(|ui| {
+                                let status = match (ctrl.param_of_index.is_some(), is_on) {
+                                    (true, true) => "Selected",
+                                    (true, false) => "Inactive",
+                                    (false, true) => "ON",
+                                    (false, false) => "OFF",
+                                };
+                                ui.label(format!("{param_name}: {status}"));
+                            });
+                        }
 
                         if let Some(tex) =
                             self.get_or_load_frame_texture(&ctx, &ctrl.img, state_frame)
@@ -1315,8 +1350,11 @@ impl egui_baseview::App for ZfxApp {
                     }
 
                     "Tap" => {
-                        let response = ui.allocate_rect(ctrl_rect, egui::Sense::click());
+                        let response = ui
+                            .allocate_rect(ctrl_rect, egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                         if response.clicked() {
+                            let _ = self.param_values.set(prm, max_val);
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, max_val));
                             new_gui_events.push(GuiParamEvent::SetValue(prm, max_val));
@@ -1346,7 +1384,9 @@ impl egui_baseview::App for ZfxApp {
                     }
 
                     "ImgKey" | "ImgPrm" => {
-                        let response = ui.allocate_rect(ctrl_rect, egui::Sense::click());
+                        let response = ui
+                            .allocate_rect(ctrl_rect, egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
                         let steps = total_frames.max(2);
                         let cur_step =
                             ((norm * (steps - 1) as f64).round() as usize).min(steps - 1);
@@ -1361,6 +1401,7 @@ impl egui_baseview::App for ZfxApp {
                             let next_step = (cur_step + delta) % steps;
                             let new_val = (next_step as f64 / (steps - 1) as f64)
                                 .mul_add(max_val - min_val, min_val);
+                            let _ = self.param_values.set(prm, new_val);
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, new_val));
                             new_gui_events.push(GuiParamEvent::SetValue(prm, new_val));

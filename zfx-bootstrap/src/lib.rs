@@ -718,6 +718,8 @@ pub struct Ctrl {
     pub param_of_index: Option<u32>,
     #[serde(rename = "SubCtrl", default, deserialize_with = "de_opt_u32")]
     pub sub_ctrl: Option<u32>,
+    #[serde(rename = "DisableToolTip", default, deserialize_with = "de_opt_u32")]
+    pub disable_tool_tip: Option<u32>,
 }
 
 pub struct ZfxAudioProcessor<'a> {
@@ -2010,6 +2012,59 @@ mod tests {
         );
         assert_eq!(gui::probe_frame_count("Common:Knob", None), 49);
         assert_eq!(gui::probe_frame_count("Common:FootSw", None), 2);
+        // Ensure declared_max does not short-circuit when numbered frames exist on disk
+        assert_eq!(gui::probe_frame_count("Common:Knob", Some(1)), 49);
+        assert_eq!(gui::probe_frame_count("Common:FootSw", Some(1)), 2);
+    }
+
+    #[test]
+    fn test_channel_toggle_logic() {
+        let min_val: f64 = 0.0;
+        let max_val: f64 = 1.0;
+
+        // Channel toggle function matching PushKey/Toggle implementation
+        let compute_toggle = |cur_val: f64, target_idx: u32| -> f64 {
+            let is_on = (cur_val.round() as u32) == target_idx;
+            if (max_val - min_val - 1.0).abs() < 1e-4 {
+                if is_on {
+                    if target_idx == 0 { max_val } else { min_val }
+                } else {
+                    f64::from(target_idx)
+                }
+            } else {
+                f64::from(target_idx)
+            }
+        };
+
+        // When on Lead (1.0):
+        // Clicking Rhythm (0) switches to Rhythm (0.0)
+        assert_eq!(compute_toggle(1.0, 0), 0.0);
+        // Clicking Lead (1) toggles to Rhythm (0.0)
+        assert_eq!(compute_toggle(1.0, 1), 0.0);
+
+        // When on Rhythm (0.0):
+        // Clicking Lead (1) switches to Lead (1.0)
+        assert_eq!(compute_toggle(0.0, 1), 1.0);
+        // Clicking Rhythm (0) toggles to Lead (1.0)
+        assert_eq!(compute_toggle(0.0, 0), 1.0);
+
+        // Frame selection verification:
+        let total_frames = 2;
+        let compute_frame = |cur_val: f64, target_idx: u32| -> usize {
+            let is_on = (cur_val.round() as u32) == target_idx;
+            match total_frames {
+                2 => usize::from(is_on),
+                _ => 0,
+            }
+        };
+
+        // On Rhythm (0.0): Rhythm LED is lit (frame 1), Lead LED is unlit (frame 0)
+        assert_eq!(compute_frame(0.0, 0), 1, "Rhythm LED should glow on Rhythm channel");
+        assert_eq!(compute_frame(0.0, 1), 0, "Lead LED should be dark on Rhythm channel");
+
+        // On Lead (1.0): Rhythm LED is unlit (frame 0), Lead LED is lit (frame 1)
+        assert_eq!(compute_frame(1.0, 0), 0, "Rhythm LED should be dark on Lead channel");
+        assert_eq!(compute_frame(1.0, 1), 1, "Lead LED should glow on Lead channel");
     }
 
     #[test]
