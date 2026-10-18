@@ -1158,6 +1158,97 @@ pub struct ZfxDspInstance {
     pub filter_adapter: FilterAdapter,
 }
 
+/// f64 planes for the guest DSP, allocated once when the plugin is loaded.
+///
+/// Zoom's engines dereference at least two input pointers and two output
+/// pointers, including on mono plugs.
+pub struct AudioScratch {
+    inputs: Box<[Box<[f64]>]>,
+    outputs: Box<[Box<[f64]>]>,
+    in_ptrs: Box<[*const f64]>,
+    out_ptrs: Box<[*mut f64]>,
+}
+
+impl AudioScratch {
+    #[must_use]
+    pub fn new(input_channels: usize, output_channels: usize) -> Self {
+        let n_in = input_channels.max(2);
+        let n_out = output_channels.max(2);
+        let inputs = (0..n_in)
+            .map(|_| vec![0.0f64; crate::protocol::MAX_FRAMES].into_boxed_slice())
+            .collect::<Box<[_]>>();
+        let outputs = (0..n_out)
+            .map(|_| vec![0.0f64; crate::protocol::MAX_FRAMES].into_boxed_slice())
+            .collect::<Box<[_]>>();
+        let in_ptrs = vec![std::ptr::null(); n_in].into_boxed_slice();
+        let out_ptrs = vec![std::ptr::null_mut(); n_out].into_boxed_slice();
+        Self {
+            inputs,
+            outputs,
+            in_ptrs,
+            out_ptrs,
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        inst: &ZfxDspInstance,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+    ) {
+        let frames = inputs
+            .first()
+            .map_or_else(|| outputs.first().map_or(0, |ch| ch.len()), |ch| ch.len())
+            .min(crate::protocol::MAX_FRAMES);
+        if frames == 0 {
+            return;
+        }
+
+        for (channel, plane) in self.inputs.iter_mut().enumerate() {
+            let source = inputs.get(channel).copied().or_else(|| inputs.first().copied());
+            match source {
+                Some(samples) => {
+                    for (dst, &src) in plane[..frames].iter_mut().zip(samples) {
+                        *dst = f64::from(src);
+                    }
+                    let copied = frames.min(samples.len());
+                    plane[copied..frames].fill(0.0);
+                }
+                None => plane[..frames].fill(0.0),
+            }
+        }
+        for plane in &mut self.outputs {
+            plane[..frames].fill(0.0);
+        }
+        for (ptr, plane) in self.in_ptrs.iter_mut().zip(self.inputs.iter()) {
+            *ptr = plane.as_ptr();
+        }
+        for (ptr, plane) in self.out_ptrs.iter_mut().zip(self.outputs.iter_mut()) {
+            *ptr = plane.as_mut_ptr();
+        }
+
+        let frames_i32 = i32::try_from(frames).unwrap_or(0);
+        inst.process_replacing_f64(self.in_ptrs.as_ptr(), self.out_ptrs.as_mut_ptr(), frames_i32);
+
+        for (ch, out_buf) in outputs.iter_mut().enumerate() {
+            let src_ch = if ch < self.outputs.len() { ch } else { 0 };
+            let Some(plane) = self.outputs.get(src_ch) else {
+                continue;
+            };
+            let count = out_buf.len().min(frames);
+            for (dst, &src) in out_buf[..count].iter_mut().zip(&plane[..count]) {
+                #[allow(clippy::cast_possible_truncation)]
+                let sample = src as f32;
+                *dst = if src.is_finite() {
+                    sample.clamp(-10.0, 10.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+}
+
 // SAFETY: ZfxDspInstance wraps raw VST 2.4 pointers which are thread-safe when synchronized by the host.
 unsafe impl Send for ZfxDspInstance {}
 // SAFETY: Concurrent parameter inspection is guarded by the host audio processing loop.
@@ -1280,56 +1371,6 @@ impl ZfxDspInstance {
                 in("ecx") obj,
                 clobber_abi("C"),
             );
-        }
-    }
-
-    pub fn process_audio(&self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], frames: usize) {
-        if frames == 0 {
-            return;
-        }
-        // VST DSP engines in Zoom ZFX (including Analog_Delay) unconditionally dereference
-        // at least 2 input channel pointers and 2 output channel pointers!
-        // SAFETY: Reading channel counts from validated effect pointer.
-        let dsp_ins = usize::try_from(unsafe { (*self.effect).num_inputs }.max(2)).unwrap_or(2);
-        // SAFETY: Reading channel counts from validated effect pointer.
-        let dsp_outs = usize::try_from(unsafe { (*self.effect).num_outputs }.max(2)).unwrap_or(2);
-
-        // Prepare 64-bit input buffers
-        let in_f64: Vec<Vec<f64>> = (0..dsp_ins)
-            .map(|ch| {
-                inputs
-                    .get(ch)
-                    .or_else(|| inputs.first())
-                    .map_or_else(
-                        || vec![0.0f64; frames],
-                        |buf| buf.iter().map(|&s| f64::from(s)).collect(),
-                    )
-            })
-            .collect();
-
-        let mut out_f64: Vec<Vec<f64>> = (0..dsp_outs).map(|_| vec![0.0f64; frames]).collect();
-
-        let in_ptrs: Vec<*const f64> = in_f64.iter().map(std::vec::Vec::as_ptr).collect();
-        let mut out_ptrs: Vec<*mut f64> =
-            out_f64.iter_mut().map(std::vec::Vec::as_mut_ptr).collect();
-
-        let frames_i32 = i32::try_from(frames).unwrap_or(0);
-        self.process_replacing_f64(in_ptrs.as_ptr(), out_ptrs.as_mut_ptr(), frames_i32);
-
-        // Copy back to host outputs
-        for (ch, out_buf) in outputs.iter_mut().enumerate() {
-            let src_ch = if ch < dsp_outs { ch } else { 0 };
-            if src_ch < out_f64.len() {
-                for (s_out, &s_in) in out_buf.iter_mut().zip(&out_f64[src_ch]) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let s_f32 = s_in as f32;
-                    *s_out = if s_in.is_finite() {
-                        s_f32.clamp(-10.0, 10.0)
-                    } else {
-                        0.0
-                    };
-                }
-            }
         }
     }
 

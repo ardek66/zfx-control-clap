@@ -84,6 +84,8 @@ pub struct ZfxShared {
     pub param_values: std::sync::Arc<params::ParamStore>,
     pub gui_events: std::sync::Arc<std::sync::Mutex<Vec<GuiParamEvent>>>,
     pub is_active: std::sync::atomic::AtomicBool,
+    /// One host block. The worker returns audio on the following callback.
+    pub block_latency: std::sync::atomic::AtomicU32,
     #[cfg(feature = "feat_oversampling")]
     pub oversampling_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     #[cfg(feature = "feat_oversampling")]
@@ -116,14 +118,14 @@ impl ZfxShared {
     }
 
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
     pub fn latency_samples(&self) -> u32 {
         #[cfg(feature = "feat_oversampling")]
-        return self
+        let filter = self
             .oversampling_mode()
             .latency_samples(self.oversampling_phase());
         #[cfg(not(feature = "feat_oversampling"))]
-        0
+        let filter: u32 = 0;
+        filter.saturating_add(self.block_latency.load(Ordering::Acquire))
     }
 }
 
@@ -144,7 +146,7 @@ impl Drop for ZfxShared {
                     .store(protocol::CMD_SHUTDOWN, Ordering::Release);
                 let seq = bridge.host_seq.load(Ordering::Relaxed).wrapping_add(1);
                 bridge.host_seq.store(seq, Ordering::Release);
-                protocol::futex_wake(&raw const bridge.host_seq);
+                bridge.ring_doorbell();
 
                 // Wait up to 50ms for worker to gracefully shut down
                 for _ in 0..5 {
@@ -722,6 +724,96 @@ pub struct Ctrl {
     pub disable_tool_tip: Option<u32>,
 }
 
+/// How parameter 0 bypasses the effect. Resolved once, when the processor starts.
+#[derive(Clone, Copy, Debug)]
+enum BypassMode {
+    Never,
+    /// Bypassed at or above the midpoint of the parameter range.
+    ActiveHigh { threshold: f64 },
+    /// Bypassed below the midpoint. Used for on/off and power switches.
+    ActiveLow { threshold: f64 },
+}
+
+impl BypassMode {
+    fn resolve(params: &[PluginParamDef]) -> Self {
+        let Some(param) = params.iter().find(|param| param.id == 0) else {
+            return Self::Never;
+        };
+        let name = param.name.to_lowercase();
+        let span = param.max_value - param.min_value;
+        let threshold = if span > 0.0 {
+            span.mul_add(0.5, param.min_value)
+        } else {
+            0.5
+        };
+        if name.contains("bypass") {
+            Self::ActiveHigh { threshold }
+        } else if name.contains("on/off") || name.contains("power") {
+            Self::ActiveLow { threshold }
+        } else {
+            Self::Never
+        }
+    }
+
+    fn is_bypassed(self, value: f64) -> bool {
+        match self {
+            Self::Never => false,
+            Self::ActiveHigh { threshold } => value >= threshold,
+            Self::ActiveLow { threshold } => value < threshold,
+        }
+    }
+}
+
+struct ParamBatch {
+    changes: [protocol::ParamChange; protocol::MAX_PARAM_QUEUE],
+    norms: [(usize, f32); protocol::MAX_PARAM_QUEUE],
+    count: usize,
+}
+
+impl ParamBatch {
+    fn empty() -> Self {
+        Self {
+            changes: [protocol::ParamChange::default(); protocol::MAX_PARAM_QUEUE],
+            norms: [(0, 0.0); protocol::MAX_PARAM_QUEUE],
+            count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlockTransport {
+    tempo: f64,
+    beat_pos: f64,
+    time_sig_num: u16,
+    time_sig_denom: u16,
+    is_playing: u8,
+    has_tempo: u8,
+}
+
+impl Default for BlockTransport {
+    fn default() -> Self {
+        Self {
+            tempo: 120.0,
+            beat_pos: 0.0,
+            time_sig_num: 4,
+            time_sig_denom: 4,
+            is_playing: 0,
+            has_tempo: 0,
+        }
+    }
+}
+
+struct OutgoingBlock<'a> {
+    kind: u8,
+    host_frames: u32,
+    os_factor: u8,
+    sample_rate: f32,
+    left: &'a [f32],
+    right: &'a [f32],
+    transport: BlockTransport,
+    batch: &'a ParamBatch,
+}
+
 pub struct ZfxAudioProcessor<'a> {
     pub shared: &'a ZfxShared,
     pub in_l: Vec<f32>,
@@ -739,10 +831,189 @@ pub struct ZfxAudioProcessor<'a> {
     #[cfg(feature = "feat_oversampling")]
     pub oversampler: resampler::StereoOversampler,
     pub host_sample_rate: f64,
-    pub seq: u32,
+    /// Blocks this processor has copied back from the worker.
+    pub collected: u32,
+    bypass: BypassMode,
     /// Normalized values last sent to the worker. `f32::NAN` = never sent.
     /// Parallel to `shared.params`.
     pub last_sent_norm: Vec<f32>,
+}
+
+impl ZfxAudioProcessor<'_> {
+    fn bypassed(&self) -> bool {
+        self.shared
+            .param_values
+            .get(0)
+            .is_some_and(|value| self.bypass.is_bypassed(value))
+    }
+
+    fn gather_params(&self) -> ParamBatch {
+        let mut batch = ParamBatch::empty();
+        for (idx, param) in self.shared.params.iter().enumerate() {
+            #[cfg(feature = "feat_oversampling")]
+            if matches!(
+                param.id,
+                PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD
+            ) {
+                continue;
+            }
+            let Some(val) = self.shared.param_values.get(param.id) else {
+                continue;
+            };
+            let range = param.max_value - param.min_value;
+            #[allow(clippy::cast_possible_truncation)]
+            let norm = if range > 0.0 {
+                ((val - param.min_value) / range).clamp(0.0, 1.0) as f32
+            } else {
+                val.clamp(0.0, 1.0) as f32
+            };
+            let changed = match self.last_sent_norm.get(idx).copied() {
+                Some(last) if last.is_finite() => (last - norm).abs() > 1e-5,
+                _ => true,
+            };
+            if changed && batch.count < protocol::MAX_PARAM_QUEUE {
+                batch.changes[batch.count] = protocol::ParamChange {
+                    id: param.id,
+                    value: norm,
+                };
+                batch.norms[batch.count] = (idx, norm);
+                batch.count += 1;
+            }
+        }
+        batch
+    }
+
+    fn commit_params(&mut self, batch: &ParamBatch) {
+        for &(idx, norm) in &batch.norms[..batch.count] {
+            if let Some(slot) = self.last_sent_norm.get_mut(idx) {
+                *slot = norm;
+            }
+        }
+    }
+
+    /// Queue parameter changes without samples. A zero sample rate leaves the
+    /// worker's current rate alone, including while oversampling.
+    fn try_send_params(&self, transport: BlockTransport, batch: &ParamBatch) -> bool {
+        if batch.count == 0 {
+            return false;
+        }
+        let ptr = self.shared.bridge_ptr;
+        if ptr.is_null() {
+            return false;
+        }
+        // SAFETY: `bridge_ptr` is the mapped bridge and outlives this processor.
+        // The pointer is copied so this shared reference is not a borrow of `self`.
+        let bridge = unsafe { &*ptr };
+        Self::write_block(
+            bridge,
+            self.collected,
+            &OutgoingBlock {
+                kind: protocol::SLOT_PARAMS,
+                host_frames: 0,
+                os_factor: 1,
+                sample_rate: 0.0,
+                left: &[],
+                right: &[],
+                transport,
+                batch,
+            },
+        )
+    }
+
+    fn skip_finished_blocks(&mut self) {
+        let ptr = self.shared.bridge_ptr;
+        if ptr.is_null() {
+            return;
+        }
+        // SAFETY: same mapped bridge as `try_send_params`.
+        let bridge = unsafe { &*ptr };
+        bridge.skip_finished(&mut self.collected);
+    }
+
+    fn write_block(
+        bridge: &protocol::ZfxSharedBridge,
+        collected: u32,
+        block: &OutgoingBlock<'_>,
+    ) -> bool {
+        let frames = block
+            .left
+            .len()
+            .min(block.right.len())
+            .min(protocol::MAX_FRAMES);
+        bridge.try_publish(collected, |slot| {
+            slot.kind = block.kind;
+            slot.num_frames = u32::try_from(frames).unwrap_or(0);
+            slot.host_frames = block.host_frames;
+            slot.os_factor = block.os_factor;
+            slot.sample_rate = block.sample_rate;
+            slot.block_size = slot.num_frames;
+            slot.num_param_changes = u32::try_from(block.batch.count).unwrap_or(0);
+            slot.param_queue[..block.batch.count]
+                .copy_from_slice(&block.batch.changes[..block.batch.count]);
+            slot.tempo = block.transport.tempo;
+            slot.beat_pos = block.transport.beat_pos;
+            slot.time_sig_num = block.transport.time_sig_num;
+            slot.time_sig_denom = block.transport.time_sig_denom;
+            slot.is_playing = block.transport.is_playing;
+            slot.has_tempo = block.transport.has_tempo;
+            if frames > 0 {
+                slot.in_l[..frames].copy_from_slice(&block.left[..frames]);
+                slot.in_r[..frames].copy_from_slice(&block.right[..frames]);
+            }
+        })
+    }
+
+    /// Copy the previous finished block into `out_l` / `out_r`. Missing audio stays silent.
+    fn pull_output(&mut self, bridge: &protocol::ZfxSharedBridge, host_frames: usize) {
+        let count = host_frames.min(self.out_l.len()).min(self.out_r.len());
+        self.out_l[..count].fill(0.0);
+        self.out_r[..count].fill(0.0);
+
+        #[cfg(not(feature = "feat_oversampling"))]
+        {
+            let _ = bridge.collect_output(&mut self.collected, &mut self.out_l, &mut self.out_r);
+        }
+
+        #[cfg(feature = "feat_oversampling")]
+        let Some(block) = bridge.collect_output(
+            &mut self.collected,
+            &mut self.os_out_l,
+            &mut self.os_out_r,
+        ) else {
+            return;
+        };
+
+        #[cfg(feature = "feat_oversampling")]
+        let block_host = usize::try_from(block.host_frames).unwrap_or(0);
+        #[cfg(feature = "feat_oversampling")]
+        let dsp_frames = usize::try_from(block.dsp_frames).unwrap_or(0);
+        #[cfg(feature = "feat_oversampling")]
+        if block.os_factor <= 1 {
+            let n = block_host
+                .min(dsp_frames)
+                .min(count)
+                .min(self.os_out_l.len())
+                .min(self.os_out_r.len());
+            self.out_l[..n].copy_from_slice(&self.os_out_l[..n]);
+            self.out_r[..n].copy_from_slice(&self.os_out_r[..n]);
+            return;
+        }
+
+        #[cfg(feature = "feat_oversampling")]
+        if block_host > 0
+            && block_host <= count
+            && dsp_frames == block_host * usize::from(block.os_factor)
+            && dsp_frames <= self.os_out_l.len()
+            && self.oversampler.mode().factor() == usize::from(block.os_factor)
+        {
+            self.oversampler.downsample(
+                &self.os_out_l[..dsp_frames],
+                &self.os_out_r[..dsp_frames],
+                &mut self.out_l[..block_host],
+                &mut self.out_r[..block_host],
+            );
+        }
+    }
 }
 
 impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
@@ -775,70 +1046,11 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
             }
         }
 
-        // Synchronize changed parameters to shared bridge even when transport is stopped
-        let bridge_ptr = self.shared.bridge_ptr;
-        if !bridge_ptr.is_null() {
-            let mut num_chgs = 0;
-            for (idx, param) in self.shared.params.iter().enumerate() {
-                #[cfg(feature = "feat_oversampling")]
-                match param.id {
-                    PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
-                    _ => {}
-                }
-                if let Some(val) = self.shared.param_values.get(param.id) {
-                    let range = param.max_value - param.min_value;
-                    let norm = if range > 0.0 {
-                        ((val - param.min_value) / range).clamp(0.0, 1.0) as f32
-                    } else {
-                        val.clamp(0.0, 1.0) as f32
-                    };
-
-                    let changed = match self.last_sent_norm.get(idx).copied() {
-                        Some(last) if last.is_finite() => (last - norm).abs() > 1e-5,
-                        _ => true,
-                    };
-
-                    if changed && num_chgs < protocol::MAX_PARAM_QUEUE {
-                        // SAFETY: `bridge_ptr` is non-null and `num_chgs` is bounded by `MAX_PARAM_QUEUE`.
-                        unsafe {
-                            (*bridge_ptr).param_queue[num_chgs] = protocol::ParamChange {
-                                id: param.id,
-                                value: norm,
-                            };
-                        }
-                        num_chgs += 1;
-                        if let Some(slot) = self.last_sent_norm.get_mut(idx) {
-                            *slot = norm;
-                        }
-                    }
-                }
-            }
-
-            if num_chgs > 0 {
-                // SAFETY: `bridge_ptr` points to valid shared memory allocated via mmap.
-                unsafe {
-                    let bridge = &mut *bridge_ptr;
-                    bridge.num_param_changes = num_chgs as u32;
-                    bridge.num_frames = 0;
-                    bridge
-                        .command
-                        .store(protocol::CMD_PROCESS, Ordering::Release);
-                    self.seq = self.seq.wrapping_add(1);
-                    if self.seq == 0 {
-                        self.seq = 1;
-                    }
-                    bridge.host_seq.store(self.seq, Ordering::Release);
-                    protocol::futex_wake(&raw const bridge.host_seq);
-
-                    for _ in 0..100 {
-                        let wseq = bridge.worker_seq.load(Ordering::Acquire);
-                        if wseq == self.seq {
-                            break;
-                        }
-                        protocol::futex_wait(&raw const bridge.worker_seq, wseq, Some(2_000));
-                    }
-                }
-            }
+        // Hand parameter changes to the worker without waiting. A full queue
+        // leaves `last_sent_norm` unchanged so a later callback retries.
+        let batch = self.gather_params();
+        if self.try_send_params(BlockTransport::default(), &batch) {
+            self.commit_params(&batch);
         }
 
         if let Ok(mut gui_evs) = self.shared.gui_events.try_lock() {
@@ -910,6 +1122,16 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         }
 
         shared.is_active.store(true, Ordering::Release);
+        shared
+            .block_latency
+            .store(config.max_frames_count, Ordering::Release);
+        let collected = if bridge_ptr.is_null() {
+            0
+        } else {
+            // SAFETY: `bridge_ptr` is the mapped bridge. Activate does not run
+            // concurrently with `process`.
+            unsafe { (*bridge_ptr).submit_seq.load(Ordering::Acquire) }
+        };
 
         #[cfg(feature = "feat_oversampling")]
         let max_os_frames = (max_frames * 4).min(protocol::MAX_FRAMES);
@@ -940,7 +1162,8 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             #[cfg(feature = "feat_oversampling")]
             oversampler,
             host_sample_rate: config.sample_rate,
-            seq: 1,
+            collected,
+            bypass: BypassMode::resolve(&shared.params),
             last_sent_norm: vec![f32::NAN; shared.params.len()],
         })
     }
@@ -957,24 +1180,20 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             return Ok(ProcessStatus::Continue);
         }
 
-        // 0. Synchronize host transport & tempo to 32-bit DSP companion
-        if let Some(transport) = process.transport {
-            // SAFETY: `bridge_ptr` points to valid shared memory allocated via mmap.
-            unsafe {
-                let bridge = &mut *bridge_ptr;
-                if transport.flags.contains(TransportFlags::HAS_TEMPO) {
-                    bridge.tempo = transport.tempo;
-                    bridge.has_tempo = 1;
-                }
-                if transport.flags.contains(TransportFlags::HAS_BEATS_TIMELINE) {
-                    bridge.beat_pos = transport.song_pos_beats.to_float();
-                }
-                if transport.flags.contains(TransportFlags::HAS_TIME_SIGNATURE) {
-                    bridge.time_sig_num = transport.time_signature_numerator;
-                    bridge.time_sig_denom = transport.time_signature_denominator;
-                }
-                bridge.is_playing = u8::from(transport.flags.contains(TransportFlags::IS_PLAYING));
+        let mut transport = BlockTransport::default();
+        if let Some(info) = process.transport {
+            if info.flags.contains(TransportFlags::HAS_TEMPO) {
+                transport.tempo = info.tempo;
+                transport.has_tempo = 1;
             }
+            if info.flags.contains(TransportFlags::HAS_BEATS_TIMELINE) {
+                transport.beat_pos = info.song_pos_beats.to_float();
+            }
+            if info.flags.contains(TransportFlags::HAS_TIME_SIGNATURE) {
+                transport.time_sig_num = info.time_signature_numerator;
+                transport.time_sig_denom = info.time_signature_denominator;
+            }
+            transport.is_playing = u8::from(info.flags.contains(TransportFlags::IS_PLAYING));
         }
 
         #[cfg(feature = "feat_oversampling")]
@@ -1012,65 +1231,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                 }
             }
 
-            // Synchronize changed parameters to shared bridge
-            let mut num_chgs = 0;
-            for (idx, param) in self.shared.params.iter().enumerate() {
-                #[cfg(feature = "feat_oversampling")]
-                match param.id {
-                    PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
-                    _ => {}
-                }
-                if let Some(val) = self.shared.param_values.get(param.id) {
-                    let range = param.max_value - param.min_value;
-                    let norm = if range > 0.0 {
-                        ((val - param.min_value) / range).clamp(0.0, 1.0) as f32
-                    } else {
-                        val.clamp(0.0, 1.0) as f32
-                    };
-
-                    let changed = match self.last_sent_norm.get(idx).copied() {
-                        Some(last) if last.is_finite() => (last - norm).abs() > 1e-5,
-                        _ => true,
-                    };
-
-                    if changed && num_chgs < protocol::MAX_PARAM_QUEUE {
-                        // SAFETY: `bridge_ptr` is non-null and `num_chgs` is bounded by `MAX_PARAM_QUEUE`.
-                        unsafe {
-                            (*bridge_ptr).param_queue[num_chgs] = protocol::ParamChange {
-                                id: param.id,
-                                value: norm,
-                            };
-                        }
-                        num_chgs += 1;
-                        if let Some(slot) = self.last_sent_norm.get_mut(idx) {
-                            *slot = norm;
-                        }
-                    }
-                }
-            }
-            // SAFETY: `bridge_ptr` points to valid shared memory allocated via mmap.
-            unsafe {
-                (*bridge_ptr).num_param_changes = num_chgs as u32;
-            }
         }
 
-        // Determine whether plugin is currently bypassed via prm 0
-        let is_bypassed = self.shared.param_values.get(0).is_some_and(|val| {
-            self.shared
-                .params
-                .iter()
-                .find(|p| p.id == 0)
-                .is_some_and(|param| {
-                    let name_lower = param.name.to_lowercase();
-                    match () {
-                        () if name_lower.contains("bypass") => val >= 50.0 || val >= 0.5,
-                        () if name_lower.contains("on/off") || name_lower.contains("power") => {
-                            val < 50.0
-                        }
-                        () => false,
-                    }
-                })
-        });
+        let batch = self.gather_params();
+        let is_bypassed = self.bypassed();
 
         // 2. Audio processing through Zoom ZFX 32-bit DSP companion
         for mut port_pair in &mut audio {
@@ -1126,6 +1290,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                 frames = frames.min(self.out_l.len()).min(self.out_r.len());
 
                 if is_bypassed {
+                    self.skip_finished_blocks();
+                    if self.try_send_params(transport, &batch) {
+                        self.commit_params(&batch);
+                    }
                     // True Software Passthrough: Bit-exact dry audio when bypassed
                     for (ch, pair) in pairs[..num_pairs].iter_mut().enumerate() {
                         if let Some(pair) = pair.take() {
@@ -1151,6 +1319,14 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                 }
 
                 if frames > 0 {
+                    let bridge_ptr = self.shared.bridge_ptr;
+                    if !bridge_ptr.is_null() {
+                        // SAFETY: non-null mapped bridge. The pointer is copied so
+                        // the following `&mut self` calls do not alias it.
+                        let bridge = unsafe { &*bridge_ptr };
+                        self.pull_output(bridge, frames);
+                    }
+
                     #[cfg(feature = "feat_oversampling")]
                     let (dsp_frames, use_oversampling) = {
                         let cur_mode = self.shared.oversampling_mode();
@@ -1178,151 +1354,57 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
 
                     let clamped_dsp_frames = dsp_frames.min(protocol::MAX_FRAMES);
                     #[cfg(feature = "feat_oversampling")]
-                    let (feed_l, feed_r) = if use_oversampling {
-                        (
-                            &self.os_in_l[..clamped_dsp_frames],
-                            &self.os_in_r[..clamped_dsp_frames],
-                        )
+                    let os_factor = u8::try_from(if use_oversampling {
+                        self.shared.oversampling_mode().factor()
                     } else {
-                        (
-                            &self.in_l[..clamped_dsp_frames],
-                            &self.in_r[..clamped_dsp_frames],
-                        )
-                    };
+                        1
+                    })
+                    .unwrap_or(1);
                     #[cfg(not(feature = "feat_oversampling"))]
-                    let (feed_l, feed_r) = (
-                        &self.in_l[..clamped_dsp_frames],
-                        &self.in_r[..clamped_dsp_frames],
-                    );
-
-                    // SAFETY: `bridge_ptr` points to valid shared memory allocated via mmap and `clamped_dsp_frames` <= `MAX_FRAMES`.
-                    unsafe {
-                        let bridge = &mut *bridge_ptr;
-                        #[cfg(feature = "feat_oversampling")]
-                        let worker_sr = {
-                            let cur_mode = self.shared.oversampling_mode();
-                            (self.host_sample_rate as f32) * (cur_mode.factor() as f32)
-                        };
-                        #[cfg(not(feature = "feat_oversampling"))]
-                        let worker_sr = self.host_sample_rate as f32;
-                        bridge.sample_rate = worker_sr;
-                        bridge.block_size = clamped_dsp_frames as u32;
-                        bridge.num_frames = clamped_dsp_frames as u32;
-                        bridge.in_l[..clamped_dsp_frames].copy_from_slice(feed_l);
-                        if num_pairs >= 2 {
-                            bridge.in_r[..clamped_dsp_frames].copy_from_slice(feed_r);
-                        } else {
-                            bridge.in_r[..clamped_dsp_frames].copy_from_slice(feed_l);
-                        }
-
-                        // Send CMD_PROCESS across bridge
-                        bridge
-                            .command
-                            .store(protocol::CMD_PROCESS, Ordering::Release);
-                        self.seq = self.seq.wrapping_add(1);
-                        if self.seq == 0 {
-                            self.seq = 1;
-                        }
-                        bridge.host_seq.store(self.seq, Ordering::Release);
-                        protocol::futex_wake(&raw const bridge.host_seq);
-
-                        // Low-latency hybrid spin + futex wait
-                        let mut timed_out = false;
-                        let mut spins = 0;
-                        loop {
-                            let wseq = bridge.worker_seq.load(Ordering::Acquire);
-                            if wseq == self.seq {
-                                break;
-                            }
-                            spins += 1;
-                            if spins > 1000 {
-                                protocol::futex_wait(
-                                    &raw const bridge.worker_seq,
-                                    wseq,
-                                    Some(5_000),
-                                );
-                                if spins > 1050 {
-                                    timed_out = true;
-                                    break;
-                                }
+                    let os_factor = 1u8;
+                    if !bridge_ptr.is_null() {
+                        // SAFETY: same mapped bridge as above.
+                        let bridge = unsafe { &*bridge_ptr };
+                        let collected = self.collected;
+                        let host_frames = u32::try_from(frames).unwrap_or(0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let sample_rate = self.host_sample_rate as f32 * f32::from(os_factor);
+                        let published = {
+                            #[cfg(feature = "feat_oversampling")]
+                            let (left, right_feed) = if use_oversampling {
+                                (
+                                    &self.os_in_l[..clamped_dsp_frames],
+                                    &self.os_in_r[..clamped_dsp_frames],
+                                )
                             } else {
-                                std::hint::spin_loop();
-                            }
-                        }
-
-                        if timed_out {
-                            self.out_l[..frames].fill(0.0);
-                            self.out_r[..frames].fill(0.0);
-                        } else {
-                            #[cfg(feature = "feat_oversampling")]
-                            if use_oversampling {
-                                let os_frames = clamped_dsp_frames
-                                    .min(self.os_out_l.len())
-                                    .min(self.os_out_r.len());
-
-                                for (dst, &src) in self.os_out_l[..os_frames]
-                                    .iter_mut()
-                                    .zip(&bridge.out_l[..os_frames])
-                                {
-                                    *dst = if src.is_finite() {
-                                        src.clamp(-4.0, 4.0)
-                                    } else {
-                                        0.0
-                                    };
-                                }
-
-                                for (dst, &src) in self.os_out_r[..os_frames]
-                                    .iter_mut()
-                                    .zip(&bridge.out_r[..os_frames])
-                                {
-                                    *dst = if src.is_finite() {
-                                        src.clamp(-4.0, 4.0)
-                                    } else {
-                                        0.0
-                                    };
-                                }
-
-                                // Downsample oversampled DSP audio back to host rate
-                                self.oversampler.downsample(
-                                    &self.os_out_l[..os_frames],
-                                    &self.os_out_r[..os_frames],
-                                    &mut self.out_l[..frames],
-                                    &mut self.out_r[..frames],
-                                );
-                            }
-
-                            #[cfg(feature = "feat_oversampling")]
-                            let needs_direct_copy = !use_oversampling;
+                                (
+                                    &self.in_l[..clamped_dsp_frames],
+                                    &self.in_r[..clamped_dsp_frames],
+                                )
+                            };
                             #[cfg(not(feature = "feat_oversampling"))]
-                            let needs_direct_copy = true;
-
-                            if needs_direct_copy {
-                                let copy_frames = clamped_dsp_frames
-                                    .min(self.out_l.len())
-                                    .min(self.out_r.len());
-
-                                for (dst, &src) in self.out_l[..copy_frames]
-                                    .iter_mut()
-                                    .zip(&bridge.out_l[..copy_frames])
-                                {
-                                    *dst = if src.is_finite() {
-                                        src.clamp(-4.0, 4.0)
-                                    } else {
-                                        0.0
-                                    };
-                                }
-
-                                for (dst, &src) in self.out_r[..copy_frames]
-                                    .iter_mut()
-                                    .zip(&bridge.out_r[..copy_frames])
-                                {
-                                    *dst = if src.is_finite() {
-                                        src.clamp(-4.0, 4.0)
-                                    } else {
-                                        0.0
-                                    };
-                                }
-                            }
+                            let (left, right_feed) = (
+                                &self.in_l[..clamped_dsp_frames],
+                                &self.in_r[..clamped_dsp_frames],
+                            );
+                            let right: &[f32] = if num_pairs >= 2 { right_feed } else { left };
+                            Self::write_block(
+                                bridge,
+                                collected,
+                                &OutgoingBlock {
+                                    kind: protocol::SLOT_AUDIO,
+                                    host_frames,
+                                    os_factor,
+                                    sample_rate,
+                                    left,
+                                    right,
+                                    transport,
+                                    batch: &batch,
+                                },
+                            )
+                        };
+                        if published {
+                            self.commit_params(&batch);
                         }
                     }
                 }
@@ -1748,10 +1830,7 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
         bridge.block_size = 256;
         bridge.command.store(protocol::CMD_INIT, Ordering::Release);
         bridge.host_seq.store(1, Ordering::Release);
-        // SAFETY: Waking worker on host sequence update.
-        unsafe {
-            protocol::futex_wake(&raw const bridge.host_seq);
-        }
+        bridge.ring_doorbell();
 
         let mut init_ok = false;
         for _ in 0..500 {
@@ -1926,6 +2005,7 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             params,
             gui_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             is_active: std::sync::atomic::AtomicBool::new(false),
+            block_latency: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "feat_oversampling")]
             oversampling_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 resampler::OversamplingMode::Off.to_u8(),
@@ -2074,6 +2154,41 @@ mod tests {
         let ctrl: Ctrl = quick_xml::de::from_str(xml).unwrap();
         assert_eq!(ctrl.center_x, Some(24.0));
         assert_eq!(ctrl.center_y, Some(23.0));
+    }
+
+    #[test]
+    fn bypass_threshold_follows_the_parameter_range() {
+        let wide = PluginParamDef {
+            id: 0,
+            name: "Bypass\0".to_string(),
+            min_value: 0.0,
+            max_value: 100.0,
+            default_value: 0.0,
+        };
+        let unit = PluginParamDef {
+            id: 0,
+            name: "Bypass\0".to_string(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: 0.0,
+        };
+        let wide_mode = BypassMode::resolve(&[wide]);
+        let unit_mode = BypassMode::resolve(&[unit]);
+        assert!(wide_mode.is_bypassed(50.0));
+        assert!(!wide_mode.is_bypassed(49.0));
+        assert!(unit_mode.is_bypassed(0.5));
+        assert!(!unit_mode.is_bypassed(0.49));
+
+        let power = PluginParamDef {
+            id: 0,
+            name: "Power\0".to_string(),
+            min_value: 0.0,
+            max_value: 1.0,
+            default_value: 1.0,
+        };
+        let power_mode = BypassMode::resolve(&[power]);
+        assert!(power_mode.is_bypassed(0.0));
+        assert!(!power_mode.is_bypassed(1.0));
     }
 
     #[test]

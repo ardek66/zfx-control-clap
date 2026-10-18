@@ -10,6 +10,7 @@ struct DspWorkerState {
     _pe: peldr::PeModule,
     inst_l: peldr::ZfxDspInstance,
     inst_r: Option<peldr::ZfxDspInstance>,
+    scratch: peldr::AudioScratch,
 }
 
 /// Reads an unaligned value of type `T` from a byte offset within an object pointer.
@@ -21,6 +22,142 @@ struct DspWorkerState {
 const unsafe fn read_offset_unaligned<T: Copy>(base: *mut u8, offset: usize) -> T {
     // SAFETY: Caller guarantees valid pointer range.
     unsafe { std::ptr::read_unaligned(base.add(offset).cast::<T>()) }
+}
+
+fn adopt_sample_rate(dsp: &DspWorkerState, sample_rate: f32) -> bool {
+    #[allow(clippy::cast_possible_truncation)]
+    let sr = sample_rate as i32;
+    if sr <= 0 || sr == peldr::CURRENT_SAMPLE_RATE.load(Ordering::Relaxed) {
+        return false;
+    }
+    peldr::CURRENT_SAMPLE_RATE.store(sr, Ordering::Relaxed);
+    dsp.inst_l.set_sample_rate(sample_rate);
+    if let Some(right) = dsp.inst_r.as_ref() {
+        right.set_sample_rate(sample_rate);
+    }
+    true
+}
+
+fn adopt_block_size(dsp: &DspWorkerState, block_size: u32) {
+    let bs = i32::try_from(block_size).unwrap_or(0);
+    if bs <= 0 || bs == peldr::CURRENT_BLOCK_SIZE.load(Ordering::Relaxed) {
+        return;
+    }
+    peldr::CURRENT_BLOCK_SIZE.store(bs, Ordering::Relaxed);
+    dsp.inst_l.set_block_size(bs);
+    if let Some(right) = dsp.inst_r.as_ref() {
+        right.set_block_size(bs);
+    }
+}
+
+fn reapply_cached_params(
+    dsp: &DspWorkerState,
+    param_cache: &[f32; protocol::MAX_PARAMS],
+    param_initialized: &[bool; protocol::MAX_PARAMS],
+) {
+    for p in 0..dsp.inst_l.num_params() {
+        let Ok(idx) = usize::try_from(p) else {
+            continue;
+        };
+        if idx >= protocol::MAX_PARAMS || !param_initialized[idx] {
+            continue;
+        }
+        let val = param_cache[idx];
+        dsp.inst_l.set_parameter(p, val);
+        if let Some(right) = dsp.inst_r.as_ref() {
+            right.set_parameter(p, val);
+        }
+    }
+}
+
+fn write_transport(slot: &protocol::ProcessSlot) {
+    if slot.has_tempo == 0 {
+        return;
+    }
+    // SAFETY: Writing transport information to the global VST time-info the guest reads.
+    unsafe {
+        peldr::CURRENT_TIME_INFO.tempo = slot.tempo;
+        peldr::CURRENT_TIME_INFO.ppq_pos = slot.beat_pos;
+        peldr::CURRENT_TIME_INFO.time_sig_numerator = i32::from(slot.time_sig_num);
+        peldr::CURRENT_TIME_INFO.time_sig_denominator = i32::from(slot.time_sig_denom);
+        if slot.is_playing != 0 {
+            peldr::CURRENT_TIME_INFO.flags |= peldr::VstTimeInfoFlags::TRANSPORT_PLAYING.bits();
+        } else {
+            peldr::CURRENT_TIME_INFO.flags &= !peldr::VstTimeInfoFlags::TRANSPORT_PLAYING.bits();
+        }
+    }
+}
+
+fn apply_param_queue(
+    dsp: &DspWorkerState,
+    slot: &protocol::ProcessSlot,
+    param_cache: &mut [f32; protocol::MAX_PARAMS],
+    param_initialized: &mut [bool; protocol::MAX_PARAMS],
+) {
+    let max_queue = u32::try_from(protocol::MAX_PARAM_QUEUE).unwrap_or(u32::MAX);
+    let num_chgs = usize::try_from(slot.num_param_changes.min(max_queue)).unwrap_or(0);
+    for &chg in &slot.param_queue[..num_chgs] {
+        let chg_id = i32::try_from(chg.id).unwrap_or(0);
+        let idx = usize::try_from(chg_id).unwrap_or(usize::MAX);
+        if idx < protocol::MAX_PARAMS {
+            param_cache[idx] = chg.value;
+            param_initialized[idx] = true;
+        }
+        dsp.inst_l.set_parameter(chg_id, chg.value);
+        if let Some(right) = dsp.inst_r.as_ref() {
+            right.set_parameter(chg_id, chg.value);
+        }
+    }
+}
+
+fn render_planes(dsp: &mut DspWorkerState, slot: &mut protocol::ProcessSlot, frames: usize) {
+    let DspWorkerState {
+        inst_l,
+        inst_r,
+        scratch,
+        ..
+    } = dsp;
+    match inst_r {
+        Some(right) => {
+            scratch.render(
+                inst_l,
+                &[&slot.in_l[..frames]],
+                &mut [&mut slot.out_l[..frames]],
+            );
+            scratch.render(
+                right,
+                &[&slot.in_r[..frames]],
+                &mut [&mut slot.out_r[..frames]],
+            );
+        }
+        None => scratch.render(
+            inst_l,
+            &[&slot.in_l[..frames], &slot.in_r[..frames]],
+            &mut [&mut slot.out_l[..frames], &mut slot.out_r[..frames]],
+        ),
+    }
+}
+
+fn render_slot(
+    dsp: &mut DspWorkerState,
+    slot: &mut protocol::ProcessSlot,
+    param_cache: &mut [f32; protocol::MAX_PARAMS],
+    param_initialized: &mut [bool; protocol::MAX_PARAMS],
+) {
+    if adopt_sample_rate(dsp, slot.sample_rate) {
+        reapply_cached_params(dsp, param_cache, param_initialized);
+    }
+    adopt_block_size(dsp, slot.block_size);
+    write_transport(slot);
+    apply_param_queue(dsp, slot, param_cache, param_initialized);
+
+    let frames = usize::try_from(slot.num_frames)
+        .unwrap_or(0)
+        .min(protocol::MAX_FRAMES);
+    if frames == 0 {
+        return;
+    }
+    render_planes(dsp, slot, frames);
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
@@ -194,6 +331,11 @@ fn main() {
             None
         };
 
+        let mut scratch = peldr::AudioScratch::new(
+            usize::try_from(inst.num_inputs()).unwrap_or(2),
+            usize::try_from(inst.num_outputs()).unwrap_or(2),
+        );
+
         let in_buf_l: Vec<f32> = (0..256)
             .map(|i| (f32::from(u8::try_from(i).unwrap()) * 0.1_f32).sin() * 0.5_f32)
             .collect();
@@ -204,15 +346,19 @@ fn main() {
         let mut out_r = vec![0.0f32; 256];
 
         if let Some(ref inst_r) = inst2 {
-            inst.process_audio(&[&in_buf_l], &mut [&mut out_l], 256);
-            inst_r.process_audio(&[&in_buf_r], &mut [&mut out_r], 256);
+            scratch.render(&inst, &[&in_buf_l], &mut [&mut out_l]);
+            scratch.render(inst_r, &[&in_buf_r], &mut [&mut out_r]);
             eprintln!(
                 "[test] Dual-DSP success! L non-zeros={}/256, R non-zeros={}/256",
                 out_l.iter().filter(|&&x| x.abs() > 1e-6).count(),
                 out_r.iter().filter(|&&x| x.abs() > 1e-6).count()
             );
         } else {
-            inst.process_audio(&[&in_buf_l, &in_buf_r], &mut [&mut out_l, &mut out_r], 256);
+            scratch.render(
+                &inst,
+                &[&in_buf_l, &in_buf_r],
+                &mut [&mut out_l, &mut out_r],
+            );
             eprintln!(
                 "[test] Native stereo process success! L non-zeros={}/256, R non-zeros={}/256",
                 out_l.iter().filter(|&&x| x.abs() > 1e-6).count(),
@@ -232,8 +378,10 @@ fn main() {
         let meas_start = 8192;
         let meas_len = 8192.0_f32;
 
-        // Helper to process audio in standard 256-sample blocks
-        let run_steady_sine = |target_sr: f32, freq: f32| -> f32 {
+        // Helper to process audio in standard 256-sample blocks.
+        // Scoped so the closure releases `scratch` before the benchmark below.
+        {
+        let mut run_steady_sine = |target_sr: f32, freq: f32| -> f32 {
             inst.set_sample_rate(target_sr);
             inst.set_block_size(256);
             inst.resume();
@@ -252,12 +400,7 @@ fn main() {
 
             for start in (0..total_frames).step_by(256) {
                 let end = (start + 256).min(total_frames);
-                let chunk_len = end - start;
-                inst.process_audio(
-                    &[&in_sine[start..end]],
-                    &mut [&mut out[start..end]],
-                    chunk_len,
-                );
+                scratch.render(&inst, &[&in_sine[start..end]], &mut [&mut out[start..end]]);
             }
 
             let in_rms =
@@ -287,6 +430,7 @@ fn main() {
             let err = gain_db - ref_gains_db[idx];
             eprintln!("[test] 192k Option B:   Freq {freq:5.0} Hz -> Gain = {gain_db:+6.2} dB (Error: {err:+6.2} dB)");
         }
+        }
         eprintln!("[test] =========================================");
         eprintln!("[test] Parameter 4 Rocking Latency Benchmark");
         eprintln!("[test] =========================================");
@@ -311,7 +455,7 @@ fn main() {
                 let pedal_pos = (f32::from(i) * 0.05_f32).sin().abs();
                 inst.set_parameter(4, pedal_pos);
                 let start = std::time::Instant::now();
-                inst.process_audio(&[&in_buf], &mut [&mut out_buf], block_size);
+                scratch.render(&inst, &[&in_buf], &mut [&mut out_buf]);
                 total_time += start.elapsed();
             }
             let avg_ms = total_time.as_secs_f64() * 1000.0 / 50.0;
@@ -410,10 +554,30 @@ fn main() {
         let worker_seq = bridge.worker_seq.load(Ordering::Relaxed);
 
         if host_seq == worker_seq {
-            // Idle wait: sleep on futex until host_seq changes
-            // SAFETY: Waiting on host_seq futex until host issues a new command.
+            if let Some(mut claimed) = bridge.claim_block() {
+                if let Some(dsp) = dsp_state.as_mut() {
+                    render_slot(
+                        dsp,
+                        claimed.slot(),
+                        &mut param_cache,
+                        &mut param_initialized,
+                    );
+                    bridge.status.store(protocol::STATUS_OK, Ordering::Release);
+                } else {
+                    bridge.status.store(protocol::STATUS_ERROR, Ordering::Release);
+                }
+                continue;
+            }
+            let bell = bridge.doorbell.load(Ordering::Acquire);
+            let submit = bridge.submit_seq.load(Ordering::Acquire);
+            let done = bridge.done_seq.load(Ordering::Relaxed);
+            if bridge.host_seq.load(Ordering::Acquire) != worker_seq || submit != done {
+                continue;
+            }
+            // SAFETY: `doorbell` is the bridge's wake word. The worker rechecks
+            // both sequences after loading it, so a missed wake is retried.
             unsafe {
-                protocol::futex_wait(&raw const bridge.host_seq, host_seq, Some(100_000));
+                protocol::futex_wait(&raw const bridge.doorbell, bell, Some(100_000));
             }
             continue;
         }
@@ -483,10 +647,15 @@ fn main() {
                                 }
                             }
 
+                            let scratch = peldr::AudioScratch::new(
+                                usize::try_from(inst_l.num_inputs()).unwrap_or(2),
+                                usize::try_from(inst_l.num_outputs()).unwrap_or(2),
+                            );
                             dsp_state = Some(DspWorkerState {
                                 _pe: pe,
                                 inst_l,
                                 inst_r,
+                                scratch,
                             });
                             bridge.status.store(protocol::STATUS_OK, Ordering::Release);
                         }
@@ -503,130 +672,6 @@ fn main() {
                             .status
                             .store(protocol::STATUS_ERROR, Ordering::Release);
                     }
-                }
-                bridge.worker_seq.store(host_seq, Ordering::Release);
-                // SAFETY: Waking host bootstrap waiting on worker_seq futex.
-                unsafe {
-                    protocol::futex_wake(&raw const bridge.worker_seq);
-                }
-            }
-
-            protocol::CMD_PROCESS => {
-                if let Some(ref dsp) = dsp_state {
-                    // Update sample rate / block size if host updated them in activate
-                    #[allow(clippy::cast_possible_truncation)]
-                    let sr = bridge.sample_rate as i32;
-                    let bs = i32::try_from(bridge.block_size).unwrap_or(256);
-                    let needs_param_reapply =
-                        if sr > 0 && sr != peldr::CURRENT_SAMPLE_RATE.load(Ordering::Relaxed) {
-                            peldr::CURRENT_SAMPLE_RATE.store(sr, Ordering::Relaxed);
-                            dsp.inst_l.set_sample_rate(bridge.sample_rate);
-                            if let Some(ref r) = dsp.inst_r {
-                                r.set_sample_rate(bridge.sample_rate);
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                    if bs > 0 && bs != peldr::CURRENT_BLOCK_SIZE.load(Ordering::Relaxed) {
-                        peldr::CURRENT_BLOCK_SIZE.store(bs, Ordering::Relaxed);
-                        dsp.inst_l.set_block_size(bs);
-                        if let Some(ref r) = dsp.inst_r {
-                            r.set_block_size(bs);
-                        }
-                    }
-
-                    if needs_param_reapply {
-                        for p in 0..dsp.inst_l.num_params() {
-                            if let Ok(idx) = usize::try_from(p) {
-                                if idx < protocol::MAX_PARAMS && param_initialized[idx] {
-                                    let val = param_cache[idx];
-                                    dsp.inst_l.set_parameter(p, val);
-                                    if let Some(ref r) = dsp.inst_r {
-                                        r.set_parameter(p, val);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Update host transport & tempo
-                    if bridge.has_tempo != 0 {
-                        // SAFETY: Writing transport information to global static CURRENT_TIME_INFO.
-                        unsafe {
-                            peldr::CURRENT_TIME_INFO.tempo = bridge.tempo;
-                            peldr::CURRENT_TIME_INFO.ppq_pos = bridge.beat_pos;
-                            peldr::CURRENT_TIME_INFO.time_sig_numerator =
-                                i32::from(bridge.time_sig_num);
-                            peldr::CURRENT_TIME_INFO.time_sig_denominator =
-                                i32::from(bridge.time_sig_denom);
-                            if bridge.is_playing != 0 {
-                                peldr::CURRENT_TIME_INFO.flags |=
-                                    peldr::VstTimeInfoFlags::TRANSPORT_PLAYING.bits();
-                            } else {
-                                peldr::CURRENT_TIME_INFO.flags &=
-                                    !peldr::VstTimeInfoFlags::TRANSPORT_PLAYING.bits();
-                            }
-                        }
-                    }
-
-                    // 1. Process queued parameter updates
-                    let max_queue = u32::try_from(protocol::MAX_PARAM_QUEUE).unwrap_or(u32::MAX);
-                    let num_chgs =
-                        usize::try_from(bridge.num_param_changes.min(max_queue)).unwrap_or(0);
-                    for &chg in &bridge.param_queue[..num_chgs] {
-                        let chg_id = i32::try_from(chg.id).unwrap_or(0);
-                        if let Ok(idx) = usize::try_from(chg_id) {
-                            if idx < protocol::MAX_PARAMS {
-                                param_cache[idx] = chg.value;
-                                param_initialized[idx] = true;
-                            }
-                        }
-                        dsp.inst_l.set_parameter(chg_id, chg.value);
-                        if let Some(ref r) = dsp.inst_r {
-                            r.set_parameter(chg_id, chg.value);
-                        }
-                    }
-
-                    // 2. Process audio
-                    let frames = usize::try_from(bridge.num_frames)
-                        .unwrap_or(0)
-                        .min(protocol::MAX_FRAMES);
-                    if frames > 0 {
-                        // SAFETY: `addr` points to valid mapped shared memory containing planar audio buffers.
-                        let (audio_in_left, audio_in_right, audio_out_left, audio_out_right) = unsafe {
-                            let b_ptr = addr.cast::<protocol::ZfxSharedBridge>();
-                            (
-                                std::slice::from_raw_parts((*b_ptr).in_l.as_ptr(), frames),
-                                std::slice::from_raw_parts((*b_ptr).in_r.as_ptr(), frames),
-                                std::slice::from_raw_parts_mut((*b_ptr).out_l.as_mut_ptr(), frames),
-                                std::slice::from_raw_parts_mut((*b_ptr).out_r.as_mut_ptr(), frames),
-                            )
-                        };
-
-                        if let Some(ref r) = dsp.inst_r {
-                            // Dual-mono True Stereo processing:
-                            // Channel 0 (Left) -> inst_l -> Channel 0 (Left)
-                            // Channel 1 (Right) -> inst_r -> Channel 1 (Right)
-                            dsp.inst_l.process_audio(
-                                &[audio_in_left],
-                                &mut [audio_out_left],
-                                frames,
-                            );
-                            r.process_audio(&[audio_in_right], &mut [audio_out_right], frames);
-                        } else {
-                            dsp.inst_l.process_audio(
-                                &[audio_in_left, audio_in_right],
-                                &mut [audio_out_left, audio_out_right],
-                                frames,
-                            );
-                        }
-                    }
-                    bridge.status.store(protocol::STATUS_OK, Ordering::Release);
-                } else {
-                    bridge
-                        .status
-                        .store(protocol::STATUS_ERROR, Ordering::Release);
                 }
                 bridge.worker_seq.store(host_seq, Ordering::Release);
                 // SAFETY: Waking host bootstrap waiting on worker_seq futex.
