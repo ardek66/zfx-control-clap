@@ -27,7 +27,6 @@ fn main() {
     #[cfg(target_os = "linux")]
     // SAFETY: Installing SIGSEGV crash handler for diagnostic backtraces.
     unsafe {
-        #[allow(clippy::as_conversions)]
         extern "C" fn crash_handler(sig: i32, info: *mut libc::siginfo_t, uctx: *mut libc::c_void) {
             // SAFETY: Dereferencing siginfo_t in signal handler to obtain faulting address.
             let addr = unsafe { (*info).si_addr() };
@@ -38,7 +37,6 @@ fn main() {
             std::process::exit(139);
         }
         let mut sa: libc::sigaction = std::mem::zeroed();
-        #[allow(clippy::as_conversions)]
         let handler_addr = crash_handler as *const () as usize;
         sa.sa_sigaction = handler_addr;
         sa.sa_flags = libc::SA_SIGINFO;
@@ -112,7 +110,6 @@ fn main() {
                 eprintln!("[test] obj={obj:?}, vtable={vtable:?}");
                 if !vtable.is_null() {
                     let dsp_set_sr_fn = *vtable.add(6);
-                    #[allow(clippy::as_conversions)]
                     let pe_base = pe.base_addr as usize;
                     eprintln!(
                         "[test] pe_base = {pe_base:#x}, RVA of vtable[6] = {:#x}",
@@ -425,7 +422,7 @@ fn main() {
             protocol::CMD_INIT => {
                 let psize = usize::try_from(bridge.payload_size).unwrap_or(0);
                 let payload = &bridge.payload_bytes[..psize];
-                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_possible_truncation)]
                 let sample_rate_i32 = bridge.sample_rate as i32;
                 peldr::CURRENT_SAMPLE_RATE.store(sample_rate_i32, Ordering::Relaxed);
                 let block_size_i32 = i32::try_from(bridge.block_size).unwrap_or(256);
@@ -516,7 +513,7 @@ fn main() {
             protocol::CMD_PROCESS => {
                 if let Some(ref dsp) = dsp_state {
                     // Update sample rate / block size if host updated them in activate
-                    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                    #[allow(clippy::cast_possible_truncation)]
                     let sr = bridge.sample_rate as i32;
                     let bs = i32::try_from(bridge.block_size).unwrap_or(256);
                     let needs_param_reapply =

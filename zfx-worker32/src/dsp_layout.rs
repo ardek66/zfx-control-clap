@@ -60,6 +60,22 @@ pub struct BiquadCoeffs {
     pub a: [f64; 2],
 }
 
+/// Typed sub-object representation for Zoom Wah / SVF Resonators.
+///
+/// Layout in 32-bit C++ heap object:
+/// - 0x00: vtable pointer (4 bytes + 4 bytes alignment padding)
+/// - 0x08: primary frequency/gain parameter `f64`
+/// - 0x10: secondary bandwidth/resonance parameter `f64`
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct WahResonatorParams {
+    pub vtable_pad: [u8; 8],
+    pub param1: f64,
+    pub param2: f64,
+}
+
+const _: () = assert!(std::mem::size_of::<WahResonatorParams>() == 24);
+
 /// Comb filter descriptor candidate found during DSP object memory probing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CombFilterDescriptor {

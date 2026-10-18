@@ -1,5 +1,4 @@
 #![allow(
-    clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -396,7 +395,7 @@ impl ZfxApp {
         ];
 
         for (idx, (m, label, tooltip)) in modes.iter().enumerate() {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let seg_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     (idx as f32).mul_add(seg_w, mode_rect.left()),
@@ -496,7 +495,7 @@ impl ZfxApp {
         ];
 
         for (idx, (p, label, tooltip)) in phases.iter().enumerate() {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let seg_rect = egui::Rect::from_min_size(
                 egui::pos2(
                     (idx as f32).mul_add(phase_seg_w, phase_rect.left()),

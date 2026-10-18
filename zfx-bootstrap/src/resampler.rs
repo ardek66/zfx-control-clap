@@ -515,7 +515,7 @@ mod tests {
         let mut in_l = vec![0.0f32; n];
         let mut in_r = vec![0.0f32; n];
         for i in 0..n {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
             in_l[i] = phase.sin();
             in_r[i] = phase.cos();
@@ -552,7 +552,7 @@ mod tests {
         let mut in_l = vec![0.0f32; n];
         let mut in_r = vec![0.0f32; n];
         for i in 0..n {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
             in_l[i] = phase.sin();
             in_r[i] = phase.cos();
@@ -588,7 +588,7 @@ mod tests {
         let mut in_l = vec![0.0f32; n];
         let mut in_r = vec![0.0f32; n];
         for i in 0..n {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
             in_l[i] = phase.sin();
             in_r[i] = phase.cos();
@@ -624,7 +624,7 @@ mod tests {
         let mut in_l = vec![0.0f32; n];
         let mut in_r = vec![0.0f32; n];
         for i in 0..n {
-            #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)]
             let phase = 2.0 * std::f32::consts::PI * 1000.0 * (i as f32) / 48000.0;
             in_l[i] = phase.sin();
             in_r[i] = phase.cos();

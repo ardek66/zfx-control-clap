@@ -1,5 +1,4 @@
 #![allow(
-    clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -428,90 +427,44 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
     }
 }
 
-impl PluginStateImpl for ZfxMainThread<'_> {
-    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
-        let mut sorted_entries: Vec<(u32, f64)> = {
-            let values = self
-                .shared
-                .param_values
-                .read()
-                .map_err(|_| PluginError::Message("Failed to read params"))?;
-            values.iter().map(|(&k, &v)| (k, v)).collect()
-        };
-        sorted_entries.sort_by_key(|&(k, _)| k);
+use zerocopy::{little_endian as le, FromBytes, Immutable, IntoBytes, KnownLayout};
 
-        let mut data = Vec::with_capacity(16 + sorted_entries.len() * 12);
-        data.extend_from_slice(b"ZFXS");
-        data.extend_from_slice(&2u32.to_le_bytes()); // State version 2
-        let count_u32 = u32::try_from(sorted_entries.len())
-            .map_err(|_| PluginError::Message("Too many parameters to serialize"))?;
-        data.extend_from_slice(&count_u32.to_le_bytes());
+/// Header for ZFX serialized plugin state (12 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ZfxStateHeader {
+    pub magic: [u8; 4],
+    pub version: le::U32,
+    pub count: le::U32,
+}
 
-        // Header v2 extension: oversampling mode + phase byte + 2 bytes padding (feat_oversampling only)
-        #[cfg(feature = "feat_oversampling")]
-        {
-            data.push(self.shared.oversampling_mode().to_u8());
-            data.push(self.shared.oversampling_phase().to_u8());
-            data.extend_from_slice(&[0u8; 2]);
-        }
-        #[cfg(not(feature = "feat_oversampling"))]
-        {
-            // State version 1 has no extra header bytes
-            // Rewrite the version field to 1 so old-format state round-trips cleanly
-            data[4..8].copy_from_slice(&1u32.to_le_bytes());
-        }
+/// Header extension for version 2 state (oversampling mode & phase, 4 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ZfxStateV2Ext {
+    pub os_mode: u8,
+    pub os_phase: u8,
+    pub pad: [u8; 2],
+}
 
-        for (id, val) in sorted_entries {
-            data.extend_from_slice(&id.to_le_bytes());
-            data.extend_from_slice(&val.to_le_bytes());
-        }
+/// Serialized parameter entry (4-byte ID + 8-byte float value = 12 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ZfxStateParamEntry {
+    pub id: le::U32,
+    pub val: le::F64,
+}
 
-        output
-            .write_all(&data)
-            .map_err(|_| PluginError::Message("Failed to write state stream"))?;
-        Ok(())
-    }
+const _: () = assert!(std::mem::size_of::<ZfxStateHeader>() == 12);
+const _: () = assert!(std::mem::size_of::<ZfxStateV2Ext>() == 4);
+const _: () = assert!(std::mem::size_of::<ZfxStateParamEntry>() == 12);
 
+impl ZfxMainThread<'_> {
     #[allow(clippy::significant_drop_tightening)]
-    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
-        let mut header = [0u8; 12];
-        input
-            .read_exact(&mut header)
-            .map_err(|_| PluginError::Message("State stream too short"))?;
-
-        if &header[0..4] != b"ZFXS" {
-            return Err(PluginError::Message("Invalid ZFX state magic"));
-        }
-        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-        if version != 1 && version != 2 {
-            return Err(PluginError::Message("Unsupported ZFX state version"));
-        }
-        let count = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-
-        if version >= 2 {
-            let mut v2_extra = [0u8; 4];
-            input
-                .read_exact(&mut v2_extra)
-                .map_err(|_| PluginError::Message("Truncated v2 state header"))?;
-            #[cfg(feature = "feat_oversampling")]
-            {
-                let os_mode = resampler::OversamplingMode::from_u8(v2_extra[0]);
-                let os_phase = resampler::OversamplingPhase::from_u8(v2_extra[1]);
-                self.on_oversampling_changed(os_mode, os_phase);
-            }
-        }
-
-        let mut loaded_entries = Vec::with_capacity(count);
-        let mut entry = [0u8; 12];
-        for _ in 0..count {
-            input
-                .read_exact(&mut entry)
-                .map_err(|_| PluginError::Message("Truncated state stream"))?;
-            let id = u32::from_le_bytes(entry[0..4].try_into().unwrap());
-            let val = f64::from_le_bytes(entry[4..12].try_into().unwrap());
-            loaded_entries.push((id, val));
-        }
-
+    fn apply_loaded_params(
+        &self,
+        loaded_entries: impl IntoIterator<Item = (u32, f64)>,
+    ) -> Result<(), PluginError> {
         #[cfg(feature = "feat_oversampling")]
         let mut new_os_mode: Option<resampler::OversamplingMode> = None;
         #[cfg(feature = "feat_oversampling")]
@@ -560,6 +513,113 @@ impl PluginStateImpl for ZfxMainThread<'_> {
         }
 
         Ok(())
+    }
+}
+
+impl PluginStateImpl for ZfxMainThread<'_> {
+    fn save(&self, output: &mut OutputStream) -> Result<(), PluginError> {
+        let mut sorted_entries: Vec<(u32, f64)> = {
+            let values = self
+                .shared
+                .param_values
+                .read()
+                .map_err(|_| PluginError::Message("Failed to read params"))?;
+            values.iter().map(|(&k, &v)| (k, v)).collect()
+        };
+        sorted_entries.sort_by_key(|&(k, _)| k);
+
+        let count_u32 = u32::try_from(sorted_entries.len())
+            .map_err(|_| PluginError::Message("Too many parameters to serialize"))?;
+
+        #[cfg(feature = "feat_oversampling")]
+        let version = 2u32;
+        #[cfg(not(feature = "feat_oversampling"))]
+        let version = 1u32;
+
+        let header = ZfxStateHeader {
+            magic: *b"ZFXS",
+            version: le::U32::new(version),
+            count: le::U32::new(count_u32),
+        };
+
+        output
+            .write_all(header.as_bytes())
+            .map_err(|_| PluginError::Message("Failed to write state header"))?;
+
+        #[cfg(feature = "feat_oversampling")]
+        {
+            let v2_ext = ZfxStateV2Ext {
+                os_mode: self.shared.oversampling_mode().to_u8(),
+                os_phase: self.shared.oversampling_phase().to_u8(),
+                pad: [0; 2],
+            };
+            output
+                .write_all(v2_ext.as_bytes())
+                .map_err(|_| PluginError::Message("Failed to write v2 header ext"))?;
+        }
+
+        let entries: Vec<ZfxStateParamEntry> = sorted_entries
+            .iter()
+            .map(|&(id, val)| ZfxStateParamEntry {
+                id: le::U32::new(id),
+                val: le::F64::new(val),
+            })
+            .collect();
+
+        output
+            .write_all(entries.as_bytes())
+            .map_err(|_| PluginError::Message("Failed to write state stream"))?;
+        Ok(())
+    }
+
+    fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
+        let mut header = ZfxStateHeader {
+            magic: [0; 4],
+            version: le::U32::ZERO,
+            count: le::U32::ZERO,
+        };
+        input
+            .read_exact(header.as_mut_bytes())
+            .map_err(|_| PluginError::Message("State stream too short"))?;
+
+        if &header.magic != b"ZFXS" {
+            return Err(PluginError::Message("Invalid ZFX state magic"));
+        }
+        let version = header.version.get();
+        if version != 1 && version != 2 {
+            return Err(PluginError::Message("Unsupported ZFX state version"));
+        }
+        let count = usize::try_from(header.count.get()).unwrap_or(0);
+
+        if version >= 2 {
+            let mut v2_extra = ZfxStateV2Ext {
+                os_mode: 0,
+                os_phase: 0,
+                pad: [0; 2],
+            };
+            input
+                .read_exact(v2_extra.as_mut_bytes())
+                .map_err(|_| PluginError::Message("Truncated v2 state header"))?;
+            #[cfg(feature = "feat_oversampling")]
+            {
+                let os_mode = resampler::OversamplingMode::from_u8(v2_extra.os_mode);
+                let os_phase = resampler::OversamplingPhase::from_u8(v2_extra.os_phase);
+                self.on_oversampling_changed(os_mode, os_phase);
+            }
+        }
+
+        let mut entries = vec![
+            ZfxStateParamEntry {
+                id: le::U32::ZERO,
+                val: le::F64::ZERO,
+            };
+            count
+        ];
+        input
+            .read_exact(entries.as_mut_bytes())
+            .map_err(|_| PluginError::Message("Truncated state stream"))?;
+
+        self.apply_loaded_params(entries.iter().map(|e| (e.id.get(), e.val.get())))
     }
 }
 
@@ -2057,5 +2117,62 @@ mod tests {
         let ctrl: Ctrl = quick_xml::de::from_str(xml).unwrap();
         assert_eq!(ctrl.center_x, Some(24.0));
         assert_eq!(ctrl.center_y, Some(23.0));
+    }
+
+    #[test]
+    fn test_zerocopy_state_roundtrip() {
+        use zerocopy::IntoBytes;
+        let header = ZfxStateHeader {
+            magic: *b"ZFXS",
+            version: le::U32::new(2),
+            count: le::U32::new(3),
+        };
+        let v2_ext = ZfxStateV2Ext {
+            os_mode: 2,
+            os_phase: 1,
+            pad: [0, 0],
+        };
+        let entries = [
+            ZfxStateParamEntry {
+                id: le::U32::new(0),
+                val: le::F64::new(1.0),
+            },
+            ZfxStateParamEntry {
+                id: le::U32::new(9900),
+                val: le::F64::new(2.0),
+            },
+            ZfxStateParamEntry {
+                id: le::U32::new(9901),
+                val: le::F64::new(1.0),
+            },
+        ];
+
+        let mut data = Vec::new();
+        data.extend_from_slice(header.as_bytes());
+        data.extend_from_slice(v2_ext.as_bytes());
+        data.extend_from_slice(entries.as_bytes());
+
+        assert_eq!(data.len(), 12 + 4 + 3 * 12);
+
+        // Verify deserialization matches
+        let (parsed_hdr, rest) =
+            <ZfxStateHeader as zerocopy::FromBytes>::read_from_prefix(&data).unwrap();
+        assert_eq!(&parsed_hdr.magic, b"ZFXS");
+        assert_eq!(parsed_hdr.version.get(), 2);
+        assert_eq!(parsed_hdr.count.get(), 3);
+
+        let (parsed_ext, rest) =
+            <ZfxStateV2Ext as zerocopy::FromBytes>::read_from_prefix(rest).unwrap();
+        assert_eq!(parsed_ext.os_mode, 2);
+        assert_eq!(parsed_ext.os_phase, 1);
+
+        let parsed_entries = <[ZfxStateParamEntry] as zerocopy::FromBytes>::ref_from_bytes(rest).unwrap();
+        assert_eq!(parsed_entries.len(), 3);
+        assert_eq!(parsed_entries[0].id.get(), 0);
+        assert_eq!(parsed_entries[0].val.get(), 1.0);
+        assert_eq!(parsed_entries[1].id.get(), 9900);
+        assert_eq!(parsed_entries[1].val.get(), 2.0);
+        assert_eq!(parsed_entries[2].id.get(), 9901);
+        assert_eq!(parsed_entries[2].val.get(), 1.0);
     }
 }

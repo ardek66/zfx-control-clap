@@ -53,8 +53,7 @@ iter_skip_next = "deny"
 filter_next = "deny"
 search_is_some = "deny"
 
-# Pointer & Cast Clutter: Hunt down raw pointer math, C-style `as` coercion, and truncating casts
-as_conversions = "deny"
+# Pointer & Cast Clutter: Hunt down raw pointer math, truncating casts, and unsafe pointer alignments
 cast_lossless = "deny"
 cast_possible_truncation = "deny"
 cast_possible_wrap = "deny"

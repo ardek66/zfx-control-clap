@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use crate::analog_proto;
-use crate::dsp_layout::{BiquadCoeffs, MemoryView, Order5Coeffs};
+use crate::dsp_layout::{BiquadCoeffs, MemoryView, Order5Coeffs, WahResonatorParams};
+use zerocopy::{little_endian as le, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::sync::atomic::AtomicUsize;
 
@@ -38,13 +39,52 @@ struct SyncPtrTable([*const c_void; 4]);
 // SAFETY: SyncPtrTable wraps an immutable table of static function pointers and null entries.
 unsafe impl Sync for SyncPtrTable {}
 
-#[allow(clippy::as_conversions)]
 static HPS_VTABLE: SyncPtrTable = SyncPtrTable([
     std::ptr::null(),
     hps_pitch_calc as *const c_void,
     std::ptr::null(),
     std::ptr::null(),
 ]);
+
+/// Win32 Base Relocation Block Header (8 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageBaseRelocationBlock {
+    pub virtual_address: le::U32,
+    pub size_of_block: le::U32,
+}
+
+/// Win32 Import Directory Descriptor (20 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageImportDescriptor {
+    pub original_first_thunk: le::U32,
+    pub time_date_stamp: le::U32,
+    pub forwarder_chain: le::U32,
+    pub name_rva: le::U32,
+    pub first_thunk: le::U32,
+}
+
+/// Win32 Export Directory Table (40 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageExportDirectory {
+    pub characteristics: le::U32,
+    pub time_date_stamp: le::U32,
+    pub major_version: le::U16,
+    pub minor_version: le::U16,
+    pub name_rva: le::U32,
+    pub ordinal_base: le::U32,
+    pub number_of_functions: le::U32,
+    pub number_of_names: le::U32,
+    pub address_of_functions: le::U32,
+    pub address_of_names: le::U32,
+    pub address_of_name_ordinals: le::U32,
+}
+
+const _: () = assert!(std::mem::size_of::<ImageBaseRelocationBlock>() == 8);
+const _: () = assert!(std::mem::size_of::<ImageImportDescriptor>() == 20);
+const _: () = assert!(std::mem::size_of::<ImageExportDirectory>() == 40);
 
 /// Represents our embedded, memory-mapped Windows DLL.
 pub struct PeModule {
@@ -216,7 +256,6 @@ impl PeModule {
 
     /// Applies base relocations from the .reloc directory
     // SAFETY: Relocation targets can be unaligned in raw PE sections; read_unaligned and write_unaligned are used.
-    #[allow(clippy::cast_ptr_alignment)]
     unsafe fn apply_relocations(base_ptr: *mut u8, raw_dll: &[u8], delta: isize) {
         let pe_off =
             usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
@@ -241,27 +280,28 @@ impl PeModule {
         let mut cur = 0;
         while cur < reloc_size {
             let block_ptr = base_ptr.add(reloc_rva + cur);
-            let page_rva = usize::try_from(ptr::read_unaligned(block_ptr.cast::<u32>())).unwrap();
-            let block_size =
-                usize::try_from(ptr::read_unaligned(block_ptr.add(4).cast::<u32>())).unwrap();
+            let block: ImageBaseRelocationBlock = ptr::read_unaligned(block_ptr.cast());
+            let page_rva = usize::try_from(block.virtual_address.get()).unwrap();
+            let block_size = usize::try_from(block.size_of_block.get()).unwrap();
 
             if block_size < 8 {
                 break;
             }
 
             let num_entries = (block_size - 8) / 2;
+            let entries_ptr = block_ptr.add(8).cast::<le::U16>();
             for i in 0..num_entries {
-                let entry = ptr::read_unaligned(block_ptr.add(8 + i * 2).cast::<u16>());
+                let entry = ptr::read_unaligned(entries_ptr.add(i)).get();
                 let rtype = entry >> 12;
                 let roffset = usize::from(entry & 0x0FFF);
 
                 if rtype == 3 {
                     // IMAGE_REL_BASED_HIGHLOW (32-bit delta adjustment)
-                    let patch_addr = base_ptr.add(page_rva + roffset).cast::<u32>();
-                    let old_val = ptr::read_unaligned(patch_addr);
+                    let patch_addr = base_ptr.add(page_rva + roffset).cast::<le::U32>();
+                    let old_val = ptr::read_unaligned(patch_addr).get();
                     let delta_u32 = u32::try_from(delta.cast_unsigned()).unwrap();
                     let new_val = old_val.wrapping_add(delta_u32);
-                    ptr::write_unaligned(patch_addr, new_val);
+                    ptr::write_unaligned(patch_addr, le::U32::new(new_val));
                 }
             }
             cur += block_size;
@@ -270,7 +310,6 @@ impl PeModule {
 
     /// Resolves external Win32 / CRT functions into the Import Address Table (IAT)
     // SAFETY: Writing function pointers into pointer-aligned IAT slots.
-    #[allow(clippy::cast_ptr_alignment)]
     unsafe fn resolve_imports(base_ptr: *mut u8, raw_dll: &[u8]) {
         let pe_off =
             usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
@@ -294,11 +333,11 @@ impl PeModule {
 
         let mut desc_idx = 0;
         loop {
-            let desc_ptr = base_ptr.add(imp_rva + desc_idx * 20);
-            let oft = usize::try_from(ptr::read_unaligned(desc_ptr.cast::<u32>())).unwrap();
-            let name_rva =
-                usize::try_from(ptr::read_unaligned(desc_ptr.add(12).cast::<u32>())).unwrap();
-            let ft = usize::try_from(ptr::read_unaligned(desc_ptr.add(16).cast::<u32>())).unwrap();
+            let desc_ptr = base_ptr.add(imp_rva + desc_idx * 20).cast::<ImageImportDescriptor>();
+            let desc: ImageImportDescriptor = ptr::read_unaligned(desc_ptr);
+            let oft = usize::try_from(desc.original_first_thunk.get()).unwrap();
+            let name_rva = usize::try_from(desc.name_rva.get()).unwrap();
+            let ft = usize::try_from(desc.first_thunk.get()).unwrap();
 
             if name_rva == 0 && ft == 0 {
                 break; // End of import descriptors
@@ -314,12 +353,11 @@ impl PeModule {
             let mut slot_idx = 0;
             loop {
                 let thunk_entry =
-                    ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4).cast::<u32>());
+                    ptr::read_unaligned(base_ptr.add(thunk_rva + slot_idx * 4).cast::<le::U32>())
+                        .get();
                 if thunk_entry == 0 {
                     break;
                 }
-
-                let target_iat = base_ptr.add(iat_rva + slot_idx * 4).cast::<*mut c_void>();
 
                 if (thunk_entry & 0x8000_0000) == 0 {
                     // Import by name
@@ -331,7 +369,7 @@ impl PeModule {
 
                     let hook_ptr = resolve_import_symbol(&dll_name_str, &func_name);
                     eprintln!("[peldr import] {dll_name_str}!{func_name} -> {hook_ptr:?}");
-                    *target_iat = hook_ptr;
+                    ptr::write_unaligned(base_ptr.add(iat_rva + slot_idx * 4).cast(), hook_ptr);
                 }
 
                 slot_idx += 1;
@@ -357,33 +395,29 @@ impl PeModule {
                 return None;
             }
 
-            let exp_ptr = base_ptr.add(exp_rva);
-            let num_functions =
-                usize::try_from(ptr::read_unaligned(exp_ptr.add(20).cast::<u32>())).unwrap();
-            let num_names =
-                usize::try_from(ptr::read_unaligned(exp_ptr.add(24).cast::<u32>())).unwrap();
-            let funcs_rva =
-                usize::try_from(ptr::read_unaligned(exp_ptr.add(28).cast::<u32>())).unwrap();
-            let names_rva =
-                usize::try_from(ptr::read_unaligned(exp_ptr.add(32).cast::<u32>())).unwrap();
-            let ords_rva =
-                usize::try_from(ptr::read_unaligned(exp_ptr.add(36).cast::<u32>())).unwrap();
+            let exp: ImageExportDirectory = ptr::read_unaligned(base_ptr.add(exp_rva).cast());
+            let num_functions = usize::try_from(exp.number_of_functions.get()).unwrap();
+            let num_names = usize::try_from(exp.number_of_names.get()).unwrap();
+            let funcs_rva = usize::try_from(exp.address_of_functions.get()).unwrap();
+            let names_rva = usize::try_from(exp.address_of_names.get()).unwrap();
+            let ords_rva = usize::try_from(exp.address_of_name_ordinals.get()).unwrap();
 
             (0..num_names).find_map(|i| {
-                let n_rva = usize::try_from(ptr::read_unaligned(
-                    base_ptr.add(names_rva + i * 4).cast::<u32>(),
-                ))
+                let n_rva = usize::try_from(
+                    ptr::read_unaligned(base_ptr.add(names_rva + i * 4).cast::<le::U32>()).get(),
+                )
                 .unwrap();
                 let sym_name = CStr::from_ptr(base_ptr.add(n_rva).cast::<std::ffi::c_char>())
                     .to_string_lossy();
                 if sym_name == name {
-                    let ord = usize::from(ptr::read_unaligned(
-                        base_ptr.add(ords_rva + i * 2).cast::<u16>(),
-                    ));
+                    let ord = usize::from(
+                        ptr::read_unaligned(base_ptr.add(ords_rva + i * 2).cast::<le::U16>()).get(),
+                    );
                     if ord < num_functions {
-                        let fn_rva = usize::try_from(ptr::read_unaligned(
-                            base_ptr.add(funcs_rva + ord * 4).cast::<u32>(),
-                        ))
+                        let fn_rva = usize::try_from(
+                            ptr::read_unaligned(base_ptr.add(funcs_rva + ord * 4).cast::<le::U32>())
+                                .get(),
+                        )
                         .unwrap();
                         return Some(base_ptr.add(fn_rva).cast::<c_void>());
                     }
@@ -421,7 +455,6 @@ impl PeModule {
             unsafe { std::mem::transmute(export_fn) };
 
         // SAFETY: Converting default_audio_master host callback function pointer to raw C pointer.
-        #[allow(clippy::as_conversions)]
         let host_cb_ptr = default_audio_master as *const c_void;
         eprintln!("[peldr] Calling getinterface({host_cb_ptr:?})...");
         // SAFETY: Invoking getinterface with default_audio_master host callback under Win32ContextGuard.
@@ -491,7 +524,6 @@ impl PeModule {
     /// Automatically scans mapped PE section memory and DSP object layout to construct the universal filter adapter.
     #[allow(
         clippy::too_many_lines,
-        clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cognitive_complexity
     )]
@@ -1049,7 +1081,7 @@ impl ZfxDspInstance {
             let src_ch = if ch < dsp_outs { ch } else { 0 };
             if src_ch < out_f64.len() {
                 for (s_out, &s_in) in out_buf.iter_mut().zip(&out_f64[src_ch]) {
-                    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                    #[allow(clippy::cast_possible_truncation)]
                     let s_f32 = s_in as f32;
                     *s_out = if s_in.is_finite() {
                         s_f32.clamp(-10.0, 10.0)
@@ -1076,7 +1108,6 @@ impl ZfxDspInstance {
     }
 
     #[allow(
-        clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::too_many_lines,
         clippy::cognitive_complexity,
@@ -1286,16 +1317,19 @@ impl ZfxDspInstance {
                             let p_sub1 =
                                 std::ptr::read_unaligned(obj_u8.add(0x134).cast::<*mut u8>());
                             if is_plausible_heap_buf(p_sub1 as usize) {
-                                std::ptr::write_unaligned(
-                                    p_sub1.add(0x8).cast::<f64>(),
-                                    0.137_812_5 * ratio,
-                                );
+                                let mut params: WahResonatorParams =
+                                    std::ptr::read_unaligned(p_sub1.cast());
+                                params.param1 = 0.137_812_5 * ratio;
+                                std::ptr::write_unaligned(p_sub1.cast(), params);
                             }
                             let p_sub3 =
                                 std::ptr::read_unaligned(obj_u8.add(0x13c).cast::<*mut u8>());
                             if is_plausible_heap_buf(p_sub3 as usize) {
-                                std::ptr::write_unaligned(p_sub3.add(0x8).cast::<f64>(), 0.55 * ratio);
-                                std::ptr::write_unaligned(p_sub3.add(0x10).cast::<f64>(), 0.1 * ratio);
+                                let mut params: WahResonatorParams =
+                                    std::ptr::read_unaligned(p_sub3.cast());
+                                params.param1 = 0.55 * ratio;
+                                params.param2 = 0.1 * ratio;
+                                std::ptr::write_unaligned(p_sub3.cast(), params);
                             }
                         }
                         0x1e0 => {
@@ -1303,11 +1337,11 @@ impl ZfxDspInstance {
                             let p_sub0 =
                                 std::ptr::read_unaligned(obj_u8.add(0x114).cast::<*mut u8>());
                             if is_plausible_heap_buf(p_sub0 as usize) {
-                                std::ptr::write_unaligned(p_sub0.add(0x8).cast::<f64>(), 0.5 * ratio);
-                                std::ptr::write_unaligned(
-                                    p_sub0.add(0x10).cast::<f64>(),
-                                    0.05 * ratio,
-                                );
+                                let mut params: WahResonatorParams =
+                                    std::ptr::read_unaligned(p_sub0.cast());
+                                params.param1 = 0.5 * ratio;
+                                params.param2 = 0.05 * ratio;
+                                std::ptr::write_unaligned(p_sub0.cast(), params);
                             }
                             std::ptr::write_unaligned(obj_u8.add(0x1a0).cast::<f64>(), 0.5 * ratio);
                             std::ptr::write_unaligned(obj_u8.add(0x1e8).cast::<f64>(), 0.5 * ratio);
@@ -1524,7 +1558,6 @@ pub unsafe extern "C" fn default_audio_master(
 // Dispatches imported DLL symbol names to function hook pointer addresses.
 #[allow(
     clippy::too_many_lines,
-    clippy::as_conversions,
     clippy::fn_to_numeric_cast
 )]
 fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
@@ -1991,7 +2024,6 @@ pub const unsafe extern "stdcall" fn hook_TerminateProcess(_h: *mut c_void, _cod
 // --- MSVCR80 CRT Trampolines ---
 
 #[no_mangle]
-#[allow(clippy::as_conversions)]
 pub unsafe extern "C" fn hook_malloc(size: usize) -> *mut c_void {
     let p = libc::malloc(size);
     if !p.is_null() {
@@ -2009,7 +2041,6 @@ pub unsafe extern "C" fn hook_malloc(size: usize) -> *mut c_void {
 }
 
 #[no_mangle]
-#[allow(clippy::as_conversions)]
 pub unsafe extern "C" fn hook_free(ptr: *mut c_void) {
     if !ptr.is_null() {
         let u = ptr as usize;
