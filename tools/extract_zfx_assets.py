@@ -163,7 +163,7 @@ def main() -> int:
         print("[✓] All 86 DSP DLL payloads detected.")
 
     print("\n[✓] Asset extraction complete. You can now build the CLAP plugins:")
-    print("    python3 build_all_plugins.py --all-features --install")
+    print("    python3 tools/build_all_plugins.py --all-features --install")
     return 0
 
 

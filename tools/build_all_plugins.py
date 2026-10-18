@@ -18,7 +18,7 @@ import time
 
 # Paths relative to project root
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR
+PROJECT_ROOT = SCRIPT_DIR.parent
 ZFX_RESOURCES_DIR = PROJECT_ROOT / "wine_prefix" / "drive_c" / "Program Files (x86)" / "ZOOM" / "ZFX" / "resources"
 BOOTSTRAP_DIR = PROJECT_ROOT / "zfx-bootstrap"
 ASSETS_DIR = BOOTSTRAP_DIR / "assets"

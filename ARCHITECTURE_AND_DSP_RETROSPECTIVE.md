@@ -537,7 +537,7 @@ Original Zoom ZFX UIs were Windows GDI bitmaps. The modern CLAP bootstrap implem
 | [`zfx-worker32/src/protocol.rs`](file:///home/idf/dev/c51t/zfx-worker32/src/protocol.rs) | IPC protocol definitions for shared memory communication | `ZfxSharedBridge`, `Command`, `Response`, futex signaling |
 | [`zfx-bootstrap/src/lib.rs`](file:///home/idf/dev/c51t/zfx-bootstrap/src/lib.rs) | CLAP plugin lifecycle, supervisory process, audio processing | `ZfxPlugin`, `ZfxAudioProcessor`, `ZfxSharedBridge` |
 | [`zfx-bootstrap/src/gui.rs`](file:///home/idf/dev/c51t/zfx-bootstrap/src/gui.rs) | Vector/skeuomorphic egui GUI renderer, XML control parser | `ZfxGui`, `PluginGuiConfig`, `KnobWidget`, `MicrophonePanel` |
-| [`build_all_plugins.py`](file:///home/idf/dev/c51t/build_all_plugins.py) | Batch generator building and packaging all 86 standalone CLAP bundles | `--all-features`, `--install`, `--plugin`, dual-OS packaging |
+| [`tools/build_all_plugins.py`](file:///home/idf/dev/c51t/tools/build_all_plugins.py) | Batch generator building and packaging all 86 standalone CLAP bundles | `--all-features`, `--install`, `--plugin`, dual-OS packaging |
 
 ---
 

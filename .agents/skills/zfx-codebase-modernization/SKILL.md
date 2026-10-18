@@ -289,7 +289,7 @@ flowchart TD
     Step1["1. Build 32-bit Worker (Release)"] --> Step2["2. Cargo Clippy (-D warnings)"]
     Step2 --> Step3["3. Cargo fmt (--check)"]
     Step3 --> Step4["4. Unit Tests (cargo test)"]
-    Step4 --> Step5["5. Batch Generator (build_all_plugins.py)"]
+    Step4 --> Step5["5. Batch Generator (tools/build_all_plugins.py)"]
     Step5 --> Step6["6. CLAP Validation (clap-validator)"]
 ```
 
@@ -322,7 +322,7 @@ nix develop .#shell32 --command cargo test --manifest-path zfx-worker32/Cargo.to
 ### Step 5: Batch Plugin Generation & Installation
 Rebuilds and packages all 86 DSP and utility plugins into self-contained `.clap` bundles:
 ```bash
-nix develop --command python3 build_all_plugins.py --enable-oversampling --enable-mic-ui --install
+nix develop --command python3 tools/build_all_plugins.py --enable-oversampling --enable-mic-ui --install
 ```
 
 ### Step 6: Automated CLAP Compliance Validation

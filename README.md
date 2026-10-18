@@ -62,7 +62,7 @@ nix develop .#shell32 --command cargo build --release --manifest-path zfx-worker
 
 ```bash
 # Builds all 86 plugins with oversampling and mic-UI enabled, installing to ~/.clap/
-nix develop --command python3 build_all_plugins.py --all-features --install
+nix develop --command python3 tools/build_all_plugins.py --all-features --install
 ```
 
 ### 4. Validate Plugins with CLAP Validator

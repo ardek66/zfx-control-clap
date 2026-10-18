@@ -297,10 +297,10 @@ Zoom ZRC archives store packed assets with a null-terminated TOC. A common pitfa
 
 ### 7.1 Nix Shells
 * 32-bit compilation: `nix develop .#shell32 --command cargo build --release --manifest-path zfx-worker32/Cargo.toml`
-* 64-bit plugin generation: `nix develop --command python3 build_all_plugins.py --install`
+* 64-bit plugin generation: `nix develop --command python3 tools/build_all_plugins.py --install`
 
 ### 7.2 Self-Extracting Bundles
-`build_all_plugins.py` embeds both the target Windows DLL and the compiled `zfx-worker32` binary directly into the `.clap` shared library using `include_bytes!`. When instantiated in a DAW, the plugin creates an anonymous executable `memfd`, writes the worker payload, forks, and connects via shared memory. No auxiliary installation files are required.
+`tools/build_all_plugins.py` embeds both the target Windows DLL and the compiled `zfx-worker32` binary directly into the `.clap` shared library using `include_bytes!`. When instantiated in a DAW, the plugin creates an anonymous executable `memfd`, writes the worker payload, forks, and connects via shared memory. No auxiliary installation files are required.
 
 ---
 

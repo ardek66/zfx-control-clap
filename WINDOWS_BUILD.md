@@ -57,14 +57,14 @@ nix develop .#win32 --command cargo build --release \
 #### Step 2: Build All or Specific Plugins for Windows
 To build all plugins for 64-bit Windows:
 ```bash
-nix develop .#win64 --command python3 build_all_plugins.py \
+nix develop .#win64 --command python3 tools/build_all_plugins.py \
   --os windows \
   --target-triple x86_64-pc-windows-gnu
 ```
 
 To build a single plugin:
 ```bash
-nix develop .#win64 --command python3 build_all_plugins.py \
+nix develop .#win64 --command python3 tools/build_all_plugins.py \
   --os windows \
   --target-triple x86_64-pc-windows-gnu \
   --plugin Great_Muff
@@ -89,7 +89,7 @@ cargo build --release --target i686-pc-windows-msvc --manifest-path zfx-worker32
 
 #### Step 2: Build All Plugins
 ```powershell
-python build_all_plugins.py --os windows --install
+python tools\build_all_plugins.py --os windows --install
 ```
 *Plugins are automatically installed to `%COMMONPROGRAMFILES%\CLAP\` (e.g. `C:\Program Files\Common Files\CLAP`).*
 
@@ -105,7 +105,7 @@ You can optionally enable modern enhancements using build flags:
 
 Example:
 ```bash
-nix develop .#win64 --command python3 build_all_plugins.py \
+nix develop .#win64 --command python3 tools/build_all_plugins.py \
   --os windows \
   --target-triple x86_64-pc-windows-gnu \
   --plugin Tangerine \
