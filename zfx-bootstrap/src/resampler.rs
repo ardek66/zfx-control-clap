@@ -17,8 +17,8 @@ pub enum OversamplingMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OversamplingPhase {
-    #[default]
     Linear, // Flat group delay, linear phase Kaiser half-band (symmetric, constant PDC)
+    #[default]
     Minimum, // Zero pre-ringing, minimum phase, ultra-low latency (2/3 samples PDC)
 }
 

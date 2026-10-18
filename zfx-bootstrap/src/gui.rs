@@ -339,15 +339,10 @@ impl ZfxApp {
 
     #[cfg(feature = "feat_oversampling")]
     #[allow(clippy::too_many_lines)]
-    fn render_oversampling_badge(
-        ui: &mut egui::Ui,
-        pos: egui::Pos2,
-        oversampling_mode: &std::sync::atomic::AtomicU8,
-        oversampling_phase: &std::sync::atomic::AtomicU8,
-    ) {
-        let cur_u8 = oversampling_mode.load(std::sync::atomic::Ordering::Acquire);
+    fn render_oversampling_badge(&self, ui: &mut egui::Ui, pos: egui::Pos2) {
+        let cur_u8 = self.oversampling_mode.load(std::sync::atomic::Ordering::Acquire);
         let cur_mode = crate::resampler::OversamplingMode::from_u8(cur_u8);
-        let cur_phase_u8 = oversampling_phase.load(std::sync::atomic::Ordering::Acquire);
+        let cur_phase_u8 = self.oversampling_phase.load(std::sync::atomic::Ordering::Acquire);
         let cur_phase = crate::resampler::OversamplingPhase::from_u8(cur_phase_u8);
 
         let mode_w = 90.0;
@@ -414,7 +409,16 @@ impl ZfxApp {
             let is_hovered = resp.hovered();
 
             if resp.clicked() && !is_selected {
-                oversampling_mode.store(m.to_u8(), std::sync::atomic::Ordering::Release);
+                let mode_val = f64::from(m.to_u8());
+                self.oversampling_mode.store(m.to_u8(), std::sync::atomic::Ordering::Release);
+                if let Ok(mut values) = self.param_values.write() {
+                    values.insert(crate::PARAM_OVERSAMPLING, mode_val);
+                }
+                if let Ok(mut evs) = self.gui_events.lock() {
+                    evs.push(GuiParamEvent::BeginGesture(crate::PARAM_OVERSAMPLING));
+                    evs.push(GuiParamEvent::SetValue(crate::PARAM_OVERSAMPLING, mode_val));
+                    evs.push(GuiParamEvent::EndGesture(crate::PARAM_OVERSAMPLING));
+                }
             }
 
             resp.on_hover_ui(|ui| {
@@ -505,7 +509,16 @@ impl ZfxApp {
             let is_hovered = resp.hovered();
 
             if resp.clicked() && !is_selected {
-                oversampling_phase.store(p.to_u8(), std::sync::atomic::Ordering::Release);
+                let phase_val = f64::from(p.to_u8());
+                self.oversampling_phase.store(p.to_u8(), std::sync::atomic::Ordering::Release);
+                if let Ok(mut values) = self.param_values.write() {
+                    values.insert(crate::PARAM_OVERSAMPLING_METHOD, phase_val);
+                }
+                if let Ok(mut evs) = self.gui_events.lock() {
+                    evs.push(GuiParamEvent::BeginGesture(crate::PARAM_OVERSAMPLING_METHOD));
+                    evs.push(GuiParamEvent::SetValue(crate::PARAM_OVERSAMPLING_METHOD, phase_val));
+                    evs.push(GuiParamEvent::EndGesture(crate::PARAM_OVERSAMPLING_METHOD));
+                }
             }
 
             resp.on_hover_ui(|ui| {
@@ -589,8 +602,13 @@ impl egui_baseview::App for ZfxApp {
             .rect_filled(ui.max_rect(), 0.0, egui::Color32::from_rgb(26, 26, 28));
 
         let cat = crate::PLUGIN_CATEGORY.to_lowercase();
+        let has_controls = self
+            .layout
+            .as_ref()
+            .is_some_and(|l| l.ctrls.as_ref().is_some_and(|c| !c.ctrl.is_empty()));
         let is_cabinet =
-            cat == "cabinet" || self.layout.as_ref().is_some_and(|l| l.total.width > 1000.0);
+            (cat == "cabinet" || self.layout.as_ref().is_some_and(|l| l.total.width > 1000.0))
+                && !has_controls;
         #[cfg(feature = "feat_mic_ui")]
         let is_mic = cat == "mic" || self.layout.as_ref().is_some_and(|l| l.total.width <= 100.0);
 
@@ -612,12 +630,7 @@ impl egui_baseview::App for ZfxApp {
                 );
             }
             #[cfg(feature = "feat_oversampling")]
-            Self::render_oversampling_badge(
-                ui,
-                egui::pos2(win_w - 176.0, 10.0),
-                &self.oversampling_mode,
-                &self.oversampling_phase,
-            );
+            self.render_oversampling_badge(ui, egui::pos2(win_w - 176.0, 10.0));
             return;
         }
 
@@ -1004,12 +1017,7 @@ impl egui_baseview::App for ZfxApp {
             }
 
             #[cfg(feature = "feat_oversampling")]
-            Self::render_oversampling_badge(
-                ui,
-                egui::pos2(win_w - 188.0, 15.0),
-                &self.oversampling_mode,
-                &self.oversampling_phase,
-            );
+            self.render_oversampling_badge(ui, egui::pos2(win_w - 188.0, 15.0));
 
             return;
         }
@@ -1273,12 +1281,23 @@ impl egui_baseview::App for ZfxApp {
                     }
 
                     "PushKey" | "Toggle" => {
-                        let response = ui.allocate_rect(ctrl_rect, egui::Sense::click());
-                        let mid = min_val.midpoint(max_val);
-                        let is_on = cur_val >= mid;
+                        let is_sub = ctrl.sub_ctrl == Some(1);
+                        let response = if is_sub {
+                            ui.allocate_rect(ctrl_rect, egui::Sense::hover())
+                        } else {
+                            ui.allocate_rect(ctrl_rect, egui::Sense::click())
+                        };
 
-                        if response.clicked() {
-                            let new_val = if is_on { min_val } else { max_val };
+                        let is_on = ctrl.param_of_index.map_or_else(
+                            || cur_val >= min_val.midpoint(max_val),
+                            |target_idx| (cur_val.round() as u32) == target_idx,
+                        );
+
+                        if !is_sub && response.clicked() {
+                            let new_val = ctrl.param_of_index.map_or_else(
+                                || if is_on { min_val } else { max_val },
+                                f64::from,
+                            );
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, new_val));
                             new_gui_events.push(GuiParamEvent::SetValue(prm, new_val));
@@ -1294,11 +1313,18 @@ impl egui_baseview::App for ZfxApp {
                         };
 
                         response.on_hover_ui(|ui| {
-                            ui.label(format!(
-                                "{}: {}",
-                                param_name,
-                                if is_on { "ON" } else { "OFF" }
-                            ));
+                            let status = if ctrl.param_of_index.is_some() {
+                                if is_on {
+                                    "Selected"
+                                } else {
+                                    "Inactive"
+                                }
+                            } else if is_on {
+                                "ON"
+                            } else {
+                                "OFF"
+                            };
+                            ui.label(format!("{param_name}: {status}"));
                         });
 
                         if let Some(tex) =
@@ -1471,12 +1497,44 @@ impl egui_baseview::App for ZfxApp {
 
                     "Led" | "LedT" => {
                         let response = ui.allocate_rect(ctrl_rect, egui::Sense::hover());
+                        let is_on = ctrl.param_of_index.map_or_else(
+                            || cur_val >= min_val.midpoint(max_val),
+                            |target_idx| (cur_val.round() as u32) == target_idx,
+                        );
+
+                        let led_frame = ctrl.param_of_index.map_or_else(
+                            || {
+                                if total_frames == 2 {
+                                    usize::from(is_on)
+                                } else {
+                                    frame_idx
+                                }
+                            },
+                            |target_idx| {
+                                let is_active = (cur_val.round() as u32) == target_idx;
+                                if total_frames <= 1 {
+                                    0
+                                } else {
+                                    usize::from(is_active)
+                                }
+                            },
+                        );
+
                         response.on_hover_ui(|ui| {
-                            ui.label(format!("{param_name}: {cur_val:.1}"));
+                            let status = if ctrl.param_of_index.is_some() {
+                                if is_on {
+                                    "Active"
+                                } else {
+                                    "Inactive"
+                                }
+                            } else {
+                                &format!("{cur_val:.1}")
+                            };
+                            ui.label(format!("{param_name}: {status}"));
                         });
 
                         if let Some(tex) =
-                            self.get_or_load_frame_texture(&ctx, &ctrl.img, frame_idx)
+                            self.get_or_load_frame_texture(&ctx, &ctrl.img, led_frame)
                         {
                             ui.painter().image(
                                 tex.id(),
@@ -1561,12 +1619,7 @@ impl egui_baseview::App for ZfxApp {
             }
 
             #[cfg(feature = "feat_oversampling")]
-            Self::render_oversampling_badge(
-                ui,
-                egui::pos2(win_w - 176.0, 10.0),
-                &self.oversampling_mode,
-                &self.oversampling_phase,
-            );
+            self.render_oversampling_badge(ui, egui::pos2(win_w - 176.0, 10.0));
         }
     }
 }

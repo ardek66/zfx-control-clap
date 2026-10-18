@@ -78,6 +78,19 @@ redundant_clone = "deny"
 clone_on_copy = "deny"
 unnecessary_to_owned = "deny"
 needless_pass_by_value = "deny"
+
+# Control Flow & Pattern Matching
+comparison_chain = "deny"
+collapsible_if = "deny"
+collapsible_else_if = "deny"
+collapsible_match = "deny"
+manual_let_else = "deny"
+manual_filter_map = "deny"
+redundant_pattern_matching = "deny"
+single_match_else = "deny"
+match_same_arms = "deny"
+match_bool = "deny"
+needless_bool = "deny"
 ```
 
 ### 2.2 Structural Thresholds (`clippy.toml`)
@@ -179,6 +192,41 @@ fn test_ctrl_center_deserialization() {
 }
 ```
 
+### 3.7 Control Flow & Pattern Matching Standards
+- **Deny Branching Equality Ladders**: Never chain `if x == A ... else if x == B` when checking constants, IDs, or enums. Always use `match` (enforced via `clippy::comparison_chain = "deny"`).
+  ```rust
+  // Good: Idiomatic match on parameter IDs
+  match id {
+      PARAM_OVERSAMPLING => { ... }
+      PARAM_OVERSAMPLING_METHOD => { ... }
+      _ => {}
+  }
+  ```
+- **Flatten Nested Option/Result Ladders with `filter_map`**: Never nest `if let Some(...) { if let Some(...) { ... } }` inside loop bodies. Use iterator transformation methods to project directly to values:
+  ```rust
+  // Good: Single-pass pipeline extracting valid ID and value pairs
+  for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
+      match event.as_core_event() {
+          Some(CoreEventSpace::ParamValue(p)) => p.param_id().map(|id| (id.get(), p.value())),
+          _ => None,
+      }
+  }) {
+      param_values.insert(id, val);
+  }
+  ```
+- **`manual_let_else` for Loop Early Exits**: If an iterator chain is not applicable, use `let Some(...) = ... else { continue; }` to keep loop nesting depth at 1 (enforced via `clippy::manual_let_else = "deny"`).
+- **Match Multi-Option States**: Instead of `if a.is_some() || b.is_some()`, match on tuples `match (a, b)`:
+  ```rust
+  match (new_os_mode, new_os_phase) {
+      (None, None) => {}
+      (mode_opt, phase_opt) => {
+          let mode = mode_opt.unwrap_or_else(|| self.shared.oversampling_mode());
+          let phase = phase_opt.unwrap_or_else(|| self.shared.oversampling_phase());
+          self.on_oversampling_changed(mode, phase);
+      }
+  }
+  ```
+
 ---
 
 ## 4. Ecosystem Crate vs. `std` vs. Custom Strategy
@@ -228,8 +276,8 @@ nix develop .#shell32 --command cargo build --manifest-path zfx-worker32/Cargo.t
 # 64-bit bootstrap
 nix develop --command cargo clippy --manifest-path zfx-bootstrap/Cargo.toml --all-targets --all-features -- -D warnings
 
-# 32-bit worker
-nix develop .#shell32 --command cargo clippy --manifest-path zfx-worker32/Cargo.toml --all-targets --all-features -- -D warnings
+# 32-bit worker (specify 32-bit i686 target if running in 64-bit host environment)
+nix develop --command cargo clippy --manifest-path zfx-worker32/Cargo.toml --target i686-unknown-linux-gnu --all-targets --all-features -- -D warnings
 ```
 
 ### Step 3: Formatting Normalization Check
@@ -245,13 +293,14 @@ nix develop .#shell32 --command cargo test --manifest-path zfx-worker32/Cargo.to
 ```
 
 ### Step 5: Batch Plugin Generation & Installation
-Rebuilds and packages all 93 DSP and utility plugins into self-contained `.clap` bundles:
+Rebuilds and packages all 86 DSP and utility plugins into self-contained `.clap` bundles:
 ```bash
-nix develop --command python3 build_all_plugins.py --include-internal --install
+nix develop --command python3 build_all_plugins.py --enable-oversampling --enable-mic-ui --install
 ```
 
 ### Step 6: Automated CLAP Compliance Validation
 ```bash
-nix develop --command ./clap-validator/target/release/clap-validator validate ~/.clap/100BassMan.clap
+./clap-validator/target/release/clap-validator validate --in-process ~/.clap/PEDAL_CRY.clap
 ```
-*Expected result: 33 passed, 0 failed, 0 warnings.*
+*Expected result: 33 passed, 0 failed, 0 warnings, 11 skipped.*
+

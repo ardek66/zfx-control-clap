@@ -10,6 +10,7 @@ pub mod gui;
 pub mod protocol;
 #[cfg(feature = "feat_oversampling")]
 pub mod resampler;
+pub mod zrc;
 
 use clack_plugin::prelude::*;
 use std::sync::atomic::Ordering;
@@ -46,6 +47,11 @@ pub enum GuiParamEvent {
     SetValue(u32, f64),
     EndGesture(u32),
 }
+
+#[cfg(feature = "feat_oversampling")]
+pub const PARAM_OVERSAMPLING: u32 = 9900;
+#[cfg(feature = "feat_oversampling")]
+pub const PARAM_OVERSAMPLING_METHOD: u32 = 9901;
 
 pub struct ZfxBootstrapPlugin;
 
@@ -292,31 +298,100 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
 
     fn value_to_text(
         &self,
-        _param_id: ClapId,
+        param_id: ClapId,
         value: f64,
         writer: &mut ParamDisplayWriter,
     ) -> core::fmt::Result {
         use core::fmt::Write;
-        write!(writer, "{value:.2}")
+        match param_id.get() {
+            #[cfg(feature = "feat_oversampling")]
+            PARAM_OVERSAMPLING => match value.round() as u8 {
+                1 => write!(writer, "2x"),
+                2 => write!(writer, "4x"),
+                _ => write!(writer, "1x"),
+            },
+            #[cfg(feature = "feat_oversampling")]
+            PARAM_OVERSAMPLING_METHOD => match value.round() as u8 {
+                0 => write!(writer, "Linear"),
+                _ => write!(writer, "Minimal"),
+            },
+            _ => write!(writer, "{value:.2}"),
+        }
     }
 
-    fn text_to_value(&self, _param_id: ClapId, text: &CStr) -> Option<f64> {
-        text.to_str().ok()?.parse::<f64>().ok()
+    fn text_to_value(&self, param_id: ClapId, text: &CStr) -> Option<f64> {
+        let s = text.to_str().ok()?;
+        match param_id.get() {
+            #[cfg(feature = "feat_oversampling")]
+            PARAM_OVERSAMPLING => {
+                let lower = s.to_lowercase();
+                if lower.contains("4x") {
+                    Some(2.0)
+                } else if lower.contains("2x") {
+                    Some(1.0)
+                } else if lower.contains("1x") || lower.contains("off") {
+                    Some(0.0)
+                } else {
+                    s.parse::<f64>().ok()
+                }
+            }
+            #[cfg(feature = "feat_oversampling")]
+            PARAM_OVERSAMPLING_METHOD => {
+                let lower = s.to_lowercase();
+                if lower.contains("lin") {
+                    Some(0.0)
+                } else if lower.contains("min") {
+                    Some(1.0)
+                } else {
+                    s.parse::<f64>().ok()
+                }
+            }
+            _ => s.parse::<f64>().ok(),
+        }
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn flush(
         &self,
         input_parameter_changes: &InputEvents,
         output_parameter_changes: &mut OutputEvents,
     ) {
+        #[cfg(feature = "feat_oversampling")]
+        let mut new_os_mode: Option<resampler::OversamplingMode> = None;
+        #[cfg(feature = "feat_oversampling")]
+        let mut new_os_phase: Option<resampler::OversamplingPhase> = None;
         {
             let mut param_values = self.shared.param_values.write().unwrap();
-            for event in input_parameter_changes {
-                if let Some(CoreEventSpace::ParamValue(param_value_event)) = event.as_core_event() {
-                    if let Some(param_id) = param_value_event.param_id() {
-                        param_values.insert(param_id.get(), param_value_event.value());
+            for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
+                match event.as_core_event() {
+                    Some(CoreEventSpace::ParamValue(p)) => {
+                        p.param_id().map(|id| (id.get(), p.value()))
                     }
+                    _ => None,
                 }
+            }) {
+                param_values.insert(id, val);
+                #[cfg(feature = "feat_oversampling")]
+                match id {
+                    PARAM_OVERSAMPLING => {
+                        new_os_mode =
+                            Some(resampler::OversamplingMode::from_u8(val.round() as u8));
+                    }
+                    PARAM_OVERSAMPLING_METHOD => {
+                        new_os_phase =
+                            Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(feature = "feat_oversampling")]
+        match (new_os_mode, new_os_phase) {
+            (None, None) => {}
+            (mode_opt, phase_opt) => {
+                let mode = mode_opt.unwrap_or_else(|| self.shared.oversampling_mode());
+                let phase = phase_opt.unwrap_or_else(|| self.shared.oversampling_phase());
+                self.on_oversampling_changed(mode, phase);
             }
         }
 
@@ -397,6 +472,7 @@ impl PluginStateImpl for ZfxMainThread<'_> {
         Ok(())
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn load(&self, input: &mut InputStream) -> Result<(), PluginError> {
         let mut header = [0u8; 12];
         input
@@ -436,6 +512,10 @@ impl PluginStateImpl for ZfxMainThread<'_> {
             loaded_entries.push((id, val));
         }
 
+        #[cfg(feature = "feat_oversampling")]
+        let mut new_os_mode: Option<resampler::OversamplingMode> = None;
+        #[cfg(feature = "feat_oversampling")]
+        let mut new_os_phase: Option<resampler::OversamplingPhase> = None;
         {
             let mut values = self
                 .shared
@@ -444,8 +524,29 @@ impl PluginStateImpl for ZfxMainThread<'_> {
                 .map_err(|_| PluginError::Message("Failed to write params"))?;
             for (id, val) in loaded_entries {
                 values.insert(id, val);
+                #[cfg(feature = "feat_oversampling")]
+                match id {
+                    PARAM_OVERSAMPLING => {
+                        new_os_mode = Some(resampler::OversamplingMode::from_u8(val.round() as u8));
+                    }
+                    PARAM_OVERSAMPLING_METHOD => {
+                        new_os_phase =
+                            Some(resampler::OversamplingPhase::from_u8(val.round() as u8));
+                    }
+                    _ => {}
+                }
             }
         } // CRITICAL: Write guard `values` is dropped here BEFORE calling host_params.rescan!
+
+        #[cfg(feature = "feat_oversampling")]
+        match (new_os_mode, new_os_phase) {
+            (None, None) => {}
+            (mode_opt, phase_opt) => {
+                let mode = mode_opt.unwrap_or_else(|| self.shared.oversampling_mode());
+                let phase = phase_opt.unwrap_or_else(|| self.shared.oversampling_phase());
+                self.on_oversampling_changed(mode, phase);
+            }
+        }
 
         // Notify host that parameter values were updated from state load
         if let Some(host_params) = self
@@ -602,6 +703,10 @@ pub struct Ctrl {
     pub sl_height: Option<f32>,
     #[serde(rename = "Name", default)]
     pub name: Option<String>,
+    #[serde(rename = "ParamOfIndex", default, deserialize_with = "de_opt_u32")]
+    pub param_of_index: Option<u32>,
+    #[serde(rename = "SubCtrl", default, deserialize_with = "de_opt_u32")]
+    pub sub_ctrl: Option<u32>,
 }
 
 pub struct ZfxAudioProcessor<'a> {
@@ -633,11 +738,26 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
         output_parameter_changes: &mut OutputEvents,
     ) {
         let mut param_values = self.shared.param_values.write().unwrap();
-        for event in input_parameter_changes {
-            if let Some(CoreEventSpace::ParamValue(param_value_event)) = event.as_core_event() {
-                if let Some(param_id) = param_value_event.param_id() {
-                    param_values.insert(param_id.get(), param_value_event.value());
+        for (id, val) in input_parameter_changes.into_iter().filter_map(|event| {
+            match event.as_core_event() {
+                Some(CoreEventSpace::ParamValue(p)) => {
+                    p.param_id().map(|id| (id.get(), p.value()))
                 }
+                _ => None,
+            }
+        }) {
+            param_values.insert(id, val);
+            #[cfg(feature = "feat_oversampling")]
+            match id {
+                PARAM_OVERSAMPLING => {
+                    let mode = resampler::OversamplingMode::from_u8(val.round() as u8);
+                    self.shared.set_oversampling_mode(mode);
+                }
+                PARAM_OVERSAMPLING_METHOD => {
+                    let phase = resampler::OversamplingPhase::from_u8(val.round() as u8);
+                    self.shared.set_oversampling_phase(phase);
+                }
+                _ => {}
             }
         }
 
@@ -646,6 +766,11 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
         if !bridge_ptr.is_null() {
             let mut num_chgs = 0;
             for param in &self.shared.params {
+                #[cfg(feature = "feat_oversampling")]
+                match param.id {
+                    PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
+                    _ => {}
+                }
                 if let Some(&val) = param_values.get(&param.id) {
                     let range = param.max_value - param.min_value;
                     let norm = if range > 0.0 {
@@ -849,18 +974,37 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         // 1. Process parameter automation changes
         {
             let mut param_values = self.shared.param_values.write().unwrap();
-            for event in events.input {
-                if let Some(CoreEventSpace::ParamValue(param_value_event)) = event.as_core_event() {
-                    if let Some(param_id) = param_value_event.param_id() {
-                        let val = param_value_event.value();
-                        param_values.insert(param_id.get(), val);
+            for (id, val) in events.input.into_iter().filter_map(|event| {
+                match event.as_core_event() {
+                    Some(CoreEventSpace::ParamValue(p)) => {
+                        p.param_id().map(|id| (id.get(), p.value()))
                     }
+                    _ => None,
+                }
+            }) {
+                param_values.insert(id, val);
+                #[cfg(feature = "feat_oversampling")]
+                match id {
+                    PARAM_OVERSAMPLING => {
+                        let mode = resampler::OversamplingMode::from_u8(val.round() as u8);
+                        self.shared.set_oversampling_mode(mode);
+                    }
+                    PARAM_OVERSAMPLING_METHOD => {
+                        let phase = resampler::OversamplingPhase::from_u8(val.round() as u8);
+                        self.shared.set_oversampling_phase(phase);
+                    }
+                    _ => {}
                 }
             }
 
             // Synchronize changed parameters to shared bridge
             let mut num_chgs = 0;
             for param in &self.shared.params {
+                #[cfg(feature = "feat_oversampling")]
+                match param.id {
+                    PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
+                    _ => {}
+                }
                 if let Some(&val) = param_values.get(&param.id) {
                     let range = param.max_value - param.min_value;
                     let norm = if range > 0.0 {
@@ -939,30 +1083,38 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                             clack_plugin::process::audio::ChannelPair::InputOnly(in_buf)
                             | clack_plugin::process::audio::ChannelPair::InputOutput(in_buf, _) => {
                                 frames = in_buf.len();
-                                if ch == 0 {
-                                    if self.in_l.len() < frames {
-                                        self.in_l.resize(frames, 0.0);
+                                match ch {
+                                    0 => {
+                                        if self.in_l.len() < frames {
+                                            self.in_l.resize(frames, 0.0);
+                                        }
+                                        self.in_l[..frames].copy_from_slice(in_buf);
                                     }
-                                    self.in_l[..frames].copy_from_slice(in_buf);
-                                } else if ch == 1 {
-                                    if self.in_r.len() < frames {
-                                        self.in_r.resize(frames, 0.0);
+                                    1 => {
+                                        if self.in_r.len() < frames {
+                                            self.in_r.resize(frames, 0.0);
+                                        }
+                                        self.in_r[..frames].copy_from_slice(in_buf);
                                     }
-                                    self.in_r[..frames].copy_from_slice(in_buf);
+                                    _ => {}
                                 }
                             }
                             clack_plugin::process::audio::ChannelPair::InPlace(buf) => {
                                 frames = buf.len();
-                                if ch == 0 {
-                                    if self.in_l.len() < frames {
-                                        self.in_l.resize(frames, 0.0);
+                                match ch {
+                                    0 => {
+                                        if self.in_l.len() < frames {
+                                            self.in_l.resize(frames, 0.0);
+                                        }
+                                        self.in_l[..frames].copy_from_slice(buf);
                                     }
-                                    self.in_l[..frames].copy_from_slice(buf);
-                                } else if ch == 1 {
-                                    if self.in_r.len() < frames {
-                                        self.in_r.resize(frames, 0.0);
+                                    1 => {
+                                        if self.in_r.len() < frames {
+                                            self.in_r.resize(frames, 0.0);
+                                        }
+                                        self.in_r[..frames].copy_from_slice(buf);
                                     }
-                                    self.in_r[..frames].copy_from_slice(buf);
+                                    _ => {}
                                 }
                             }
                             clack_plugin::process::audio::ChannelPair::OutputOnly(buf) => {
@@ -1766,6 +1918,24 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             }
         }
 
+        #[cfg(feature = "feat_oversampling")]
+        {
+            params.push(PluginParamDef {
+                id: PARAM_OVERSAMPLING,
+                name: "Oversampling\0".to_string(),
+                min_value: 0.0,
+                max_value: 2.0,
+                default_value: 0.0,
+            });
+            params.push(PluginParamDef {
+                id: PARAM_OVERSAMPLING_METHOD,
+                name: "Oversampling Method\0".to_string(),
+                min_value: 0.0,
+                max_value: 1.0,
+                default_value: 1.0,
+            });
+        }
+
         let initial_param_values: std::collections::HashMap<u32, f64> =
             params.iter().map(|p| (p.id, p.default_value)).collect();
 
@@ -1798,7 +1968,7 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             )),
             #[cfg(feature = "feat_oversampling")]
             oversampling_phase: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                resampler::OversamplingPhase::Linear.to_u8(),
+                resampler::OversamplingPhase::Minimum.to_u8(),
             )),
         })
     }

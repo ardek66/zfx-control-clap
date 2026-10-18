@@ -106,8 +106,8 @@ impl AnalogFirstOrder {
     pub fn from_digital(b: [f64; 2], a: [f64; 2], fs_ref: f64) -> Self {
         let k = 2.0 * fs_ref;
 
-        let beta = [0.5 * (b[0] + b[1]), (0.5 / k) * (b[0] - b[1])];
-        let alpha = [0.5 * (a[0] + a[1]), (0.5 / k) * (a[0] - a[1])];
+        let beta = [f64::midpoint(b[0], b[1]), (0.5 / k) * (b[0] - b[1])];
+        let alpha = [f64::midpoint(a[0], a[1]), (0.5 / k) * (a[0] - a[1])];
 
         Self { beta, alpha }
     }

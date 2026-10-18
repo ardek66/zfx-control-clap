@@ -45,11 +45,6 @@ static HPS_VTABLE: SyncPtrTable = SyncPtrTable([
     std::ptr::null(),
     std::ptr::null(),
 ]);
-static mut HPS_HELPER: HpsPitchHelper = HpsPitchHelper {
-    vtable: HPS_VTABLE.0.as_ptr(),
-    active: 1,
-    pitch_index: 0,
-};
 
 /// Represents our embedded, memory-mapped Windows DLL.
 pub struct PeModule {
@@ -467,7 +462,18 @@ impl PeModule {
                         .any(|w| w == [0x8b, 0x93, 0x28, 0x03, 0x00, 0x00])
                     {
                         eprintln!("[peldr] Installed HpsPitchHelper at [obj + 0x328]");
-                        *p_sub = &raw mut HPS_HELPER;
+                        let helper = libc::malloc(std::mem::size_of::<HpsPitchHelper>()).cast::<HpsPitchHelper>();
+                        if !helper.is_null() {
+                            std::ptr::write(
+                                helper,
+                                HpsPitchHelper {
+                                    vtable: HPS_VTABLE.0.as_ptr(),
+                                    active: 1,
+                                    pitch_index: 0,
+                                },
+                            );
+                            *p_sub = helper;
+                        }
                     }
                 }
             }
@@ -1271,32 +1277,42 @@ impl ZfxDspInstance {
                 unsafe {
                     std::ptr::write_unaligned(obj_u8.add(wah_off).cast::<f64>(), target_wah);
 
-                    if wah_off == 0x1c8 {
-                        // Auto_Wah SVF range and min coefficients
-                        std::ptr::write_unaligned(obj_u8.add(0x1a8).cast::<f64>(), 0.005 * ratio);
-                        std::ptr::write_unaligned(obj_u8.add(0x1b0).cast::<f64>(), 0.03 * ratio);
+                    match wah_off {
+                        0x1c8 => {
+                            // Auto_Wah SVF range and min coefficients
+                            std::ptr::write_unaligned(obj_u8.add(0x1a8).cast::<f64>(), 0.005 * ratio);
+                            std::ptr::write_unaligned(obj_u8.add(0x1b0).cast::<f64>(), 0.03 * ratio);
 
-                        let p_sub1 = std::ptr::read_unaligned(obj_u8.add(0x134).cast::<*mut u8>());
-                        if is_plausible_heap_buf(p_sub1 as usize) {
-                            std::ptr::write_unaligned(
-                                p_sub1.add(0x8).cast::<f64>(),
-                                0.137_812_5 * ratio,
-                            );
+                            let p_sub1 =
+                                std::ptr::read_unaligned(obj_u8.add(0x134).cast::<*mut u8>());
+                            if is_plausible_heap_buf(p_sub1 as usize) {
+                                std::ptr::write_unaligned(
+                                    p_sub1.add(0x8).cast::<f64>(),
+                                    0.137_812_5 * ratio,
+                                );
+                            }
+                            let p_sub3 =
+                                std::ptr::read_unaligned(obj_u8.add(0x13c).cast::<*mut u8>());
+                            if is_plausible_heap_buf(p_sub3 as usize) {
+                                std::ptr::write_unaligned(p_sub3.add(0x8).cast::<f64>(), 0.55 * ratio);
+                                std::ptr::write_unaligned(p_sub3.add(0x10).cast::<f64>(), 0.1 * ratio);
+                            }
                         }
-                        let p_sub3 = std::ptr::read_unaligned(obj_u8.add(0x13c).cast::<*mut u8>());
-                        if is_plausible_heap_buf(p_sub3 as usize) {
-                            std::ptr::write_unaligned(p_sub3.add(0x8).cast::<f64>(), 0.55 * ratio);
-                            std::ptr::write_unaligned(p_sub3.add(0x10).cast::<f64>(), 0.1 * ratio);
+                        0x1e0 => {
+                            // PEDAL_CRY resonator normalized frequency parameter
+                            let p_sub0 =
+                                std::ptr::read_unaligned(obj_u8.add(0x114).cast::<*mut u8>());
+                            if is_plausible_heap_buf(p_sub0 as usize) {
+                                std::ptr::write_unaligned(p_sub0.add(0x8).cast::<f64>(), 0.5 * ratio);
+                                std::ptr::write_unaligned(
+                                    p_sub0.add(0x10).cast::<f64>(),
+                                    0.05 * ratio,
+                                );
+                            }
+                            std::ptr::write_unaligned(obj_u8.add(0x1a0).cast::<f64>(), 0.5 * ratio);
+                            std::ptr::write_unaligned(obj_u8.add(0x1e8).cast::<f64>(), 0.5 * ratio);
                         }
-                    } else if wah_off == 0x1e0 {
-                        // PEDAL_CRY resonator normalized frequency parameter
-                        let p_sub0 = std::ptr::read_unaligned(obj_u8.add(0x114).cast::<*mut u8>());
-                        if is_plausible_heap_buf(p_sub0 as usize) {
-                            std::ptr::write_unaligned(p_sub0.add(0x8).cast::<f64>(), 0.5 * ratio);
-                            std::ptr::write_unaligned(p_sub0.add(0x10).cast::<f64>(), 0.05 * ratio);
-                        }
-                        std::ptr::write_unaligned(obj_u8.add(0x1a0).cast::<f64>(), 0.5 * ratio);
-                        std::ptr::write_unaligned(obj_u8.add(0x1e8).cast::<f64>(), 0.5 * ratio);
+                        _ => {}
                     }
                 }
             }

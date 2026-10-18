@@ -45,12 +45,30 @@ INTERNAL_ROUTING_DLLS = {
     "InFsChk", "OutFsChk", "PuSelect", "Tuner", "VUMeter", "mn2ste", "ste2mn"
 }
 
+def get_matching_asset_dir(plugin_name: str) -> Path | None:
+    direct = ASSETS_DIR / plugin_name
+    if direct.is_dir():
+        return direct
+    # Case-insensitive search
+    for item in ASSETS_DIR.iterdir():
+        if item.is_dir() and item.name.lower() == plugin_name.lower():
+            return item
+    return None
+
 # Category classifier for CLAP features and metadata
 def classify_plugin(name: str) -> str:
+    asset_dir = get_matching_asset_dir(name)
+    has_controls = False
+    if asset_dir and (asset_dir / "EfxType.xml").exists():
+        xml_content = (asset_dir / "EfxType.xml").read_text(encoding="utf-8", errors="ignore")
+        has_controls = "<Ctrl " in xml_content
+
     name_lower = name.lower()
-    if any(k in name_lower for k in ["stack", "combo"]):
+    is_speaker_cab = any(dim in name_lower for dim in ["1x18", "4x12", "4x10", "2x12", "8x10"])
+
+    if is_speaker_cab or (not has_controls and any(k in name_lower for k in ["stack", "combo"])):
         return "cabinet"
-    elif any(k in name_lower for k in ["amp", "bassman", "1959", "custom", "bert", "crunch", "superb", "hrt3500", "tweed"]):
+    elif any(k in name_lower for k in ["amp", "bassman", "1959", "custom", "bert", "crunch", "superb", "hrt3500", "tweed", "pv_stack", "dual_head", "ac_bass", "jazz_clean", "matching30", "tangerine", "vx_uk30"]):
         return "amp"
     elif any(k in name_lower for k in ["distort", "fuzz", "muff", "squeak", "governor", "tubescream", "over_driven", "booster", "metal_world"]):
         return "distortion"
@@ -70,16 +88,6 @@ def classify_plugin(name: str) -> str:
         return "mic"
     else:
         return "utility"
-
-def get_matching_asset_dir(plugin_name: str) -> Path | None:
-    direct = ASSETS_DIR / plugin_name
-    if direct.is_dir():
-        return direct
-    # Case-insensitive search
-    for item in ASSETS_DIR.iterdir():
-        if item.is_dir() and item.name.lower() == plugin_name.lower():
-            return item
-    return None
 
 def find_target_binary(bootstrap_dir: Path, target_triple: str | None = None) -> Path | None:
     candidates = []
