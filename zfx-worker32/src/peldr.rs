@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use crate::analog_proto;
-use crate::dsp_layout::{BiquadCoeffs, MemoryView, Order5Coeffs, WahResonatorParams};
+use crate::dsp_layout::{
+    BiquadCoeffs, MemoryView, Order5Coeffs, Order5SubObject, WahResonatorParams,
+};
 use zerocopy::{little_endian as le, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::sync::atomic::AtomicUsize;
@@ -46,6 +48,138 @@ static HPS_VTABLE: SyncPtrTable = SyncPtrTable([
     std::ptr::null(),
 ]);
 
+/// Win32 DOS Executable Stub Header (64 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+#[allow(clippy::struct_field_names)]
+pub struct ImageDosHeader {
+    pub e_magic: [u8; 2], // Magic number "MZ" (0x5A4D)
+    pub e_cblp: le::U16,
+    pub e_cp: le::U16,
+    pub e_crlc: le::U16,
+    pub e_cparhdr: le::U16,
+    pub e_minalloc: le::U16,
+    pub e_maxalloc: le::U16,
+    pub e_ss: le::U16,
+    pub e_sp: le::U16,
+    pub e_csum: le::U16,
+    pub e_ip: le::U16,
+    pub e_cs: le::U16,
+    pub e_lfarlc: le::U16,
+    pub e_ovno: le::U16,
+    pub e_res: [le::U16; 4],
+    pub e_oemid: le::U16,
+    pub e_oeminfo: le::U16,
+    pub e_res2: [le::U16; 10],
+    pub e_lfanew: le::U32, // File address of new exe header (0x3C)
+}
+
+/// Win32 Data Directory Entry (8 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, Default)]
+pub struct ImageDataDirectory {
+    pub virtual_address: le::U32,
+    pub size: le::U32,
+}
+
+pub const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
+pub const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_RESOURCE: usize = 2;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_SECURITY: usize = 4;
+pub const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_DEBUG: usize = 6;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+#[allow(dead_code)]
+pub const IMAGE_DIRECTORY_ENTRY_IAT: usize = 12;
+
+/// Standard Win32 COFF File Header (20 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageFileHeader {
+    pub machine: le::U16,
+    pub number_of_sections: le::U16,
+    pub time_date_stamp: le::U32,
+    pub pointer_to_symbol_table: le::U32,
+    pub number_of_symbols: le::U32,
+    pub size_of_optional_header: le::U16,
+    pub characteristics: le::U16,
+}
+
+/// Standard Win32 32-bit Optional Header (224 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageOptionalHeader32 {
+    pub magic: le::U16, // 0x10B = PE32
+    pub major_linker_version: u8,
+    pub minor_linker_version: u8,
+    pub size_of_code: le::U32,
+    pub size_of_initialized_data: le::U32,
+    pub size_of_uninitialized_data: le::U32,
+    pub address_of_entry_point: le::U32,
+    pub base_of_code: le::U32,
+    pub base_of_data: le::U32,
+    pub image_base: le::U32,
+    pub section_alignment: le::U32,
+    pub file_alignment: le::U32,
+    pub major_operating_system_version: le::U16,
+    pub minor_operating_system_version: le::U16,
+    pub major_image_version: le::U16,
+    pub minor_image_version: le::U16,
+    pub major_subsystem_version: le::U16,
+    pub minor_subsystem_version: le::U16,
+    pub win32_version_value: le::U32,
+    pub size_of_image: le::U32,
+    pub size_of_headers: le::U32,
+    pub check_sum: le::U32,
+    pub subsystem: le::U16,
+    pub dll_characteristics: le::U16,
+    pub size_of_stack_reserve: le::U32,
+    pub size_of_stack_commit: le::U32,
+    pub size_of_heap_reserve: le::U32,
+    pub size_of_heap_commit: le::U32,
+    pub loader_flags: le::U32,
+    pub number_of_rva_and_sizes: le::U32,
+    pub data_directories: [ImageDataDirectory; 16],
+}
+
+/// Win32 NT Headers for 32-bit PE (248 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageNtHeaders32 {
+    pub signature: [u8; 4], // "PE\0\0" (0x00004550)
+    pub file_header: ImageFileHeader,
+    pub optional_header: ImageOptionalHeader32,
+}
+
+/// Win32 Section Table Header (40 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageSectionHeader {
+    pub name: [u8; 8],
+    pub virtual_size: le::U32,
+    pub virtual_address: le::U32,
+    pub size_of_raw_data: le::U32,
+    pub pointer_to_raw_data: le::U32,
+    pub pointer_to_relocations: le::U32,
+    pub pointer_to_linenumbers: le::U32,
+    pub number_of_relocations: le::U16,
+    pub number_of_linenumbers: le::U16,
+    pub characteristics: le::U32,
+}
+
+/// Win32 Import By Name Header (2 bytes hint followed by ASCII name).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ImageImportByNameHeader {
+    pub hint: le::U16,
+}
+
 /// Win32 Base Relocation Block Header (8 bytes).
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
@@ -82,9 +216,121 @@ pub struct ImageExportDirectory {
     pub address_of_name_ordinals: le::U32,
 }
 
+/// Standard Win32 Thread Information Block (TIB) on x86 (first 0x38 bytes of TEB).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct Win32Tib {
+    pub current_seh: le::U32,         // 0x00: FS:[0x00] Head of SEH chain
+    pub stack_base: le::U32,          // 0x04: FS:[0x04]
+    pub stack_limit: le::U32,         // 0x08: FS:[0x08]
+    pub sub_system_tib: le::U32,      // 0x0C: FS:[0x0C]
+    pub fiber_data: le::U32,          // 0x10: FS:[0x10]
+    pub arbitrary_user_data: le::U32, // 0x14: FS:[0x14]
+    pub self_tib: le::U32,            // 0x18: FS:[0x18] Linear address of TIB
+    pub env_pointer: le::U32,         // 0x1C: FS:[0x1C]
+    pub process_id: le::U32,          // 0x20: FS:[0x20] Win32 PID
+    pub thread_id: le::U32,           // 0x24: FS:[0x24] Win32 TID
+    pub rpc_handle: le::U32,          // 0x28: FS:[0x28]
+    pub tls_array: le::U32,           // 0x2C: FS:[0x2C]
+    pub peb_ptr: le::U32,             // 0x30: FS:[0x30] Process Environment Block
+    pub last_error: le::U32,          // 0x34: FS:[0x34]
+    pub padding: [u8; 4096 - 0x38],   // Pad to full 4KB page
+}
+
+/// Win32 Critical Section object (24 bytes).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, Default)]
+pub struct Win32CriticalSection {
+    pub debug_info: le::U32,
+    pub lock_count: le::I32,
+    pub recursion_count: le::I32,
+    pub owning_thread: le::U32,
+    pub lock_semaphore: le::U32,
+    pub spin_count: le::U32,
+}
+
+/// Win32 `SP_DEVICE_INTERFACE_DETAIL_DATA_A` Header (4 bytes cbSize).
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct SpDeviceInterfaceDetailDataHeader {
+    pub cb_size: le::U32,
+}
+
+/// ZFX Plugin Wrapper returned by `getinterface` export.
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy)]
+pub struct ZfxInterfaceWrapper {
+    pub vtable_or_host: le::U32, // Slot 0: Pointer to vtable / host callback
+    pub effect_ptr: le::U32,     // Slot 1: Pointer to VST 2.4 AEffect instance
+}
+
+/// x86 `sub esp, imm32` instruction encoding (6 bytes).
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86SubEspImm32 {
+    pub opcode: [u8; 2], // [0x81, 0xEC]
+    pub imm32: le::U32,  // 0x0000044C
+}
+
+/// Win32 x86 Hot-Patch: `mov al, 1; ret; nop; nop; nop` (6 bytes).
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DongleBypassPatch {
+    pub mov_al_1: [u8; 2], // [0xB0, 0x01]
+    pub ret: u8,          // 0xC3
+    pub nops: [u8; 3],    // [0x90, 0x90, 0x90]
+}
+
+/// x86 `jmp rel32; nop` hot-patch (6 bytes).
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86JmpRel32Nop {
+    pub opcode: u8,     // 0xE9
+    pub rel32: le::I32, // Relative displacement
+    pub nop: u8,        // 0x90
+}
+
+/// x86 SSE `movsd xmm*, qword ptr [disp32]` instruction (8 bytes).
+/// Matches `0xf2, 0x0f, 0x10, modrm, disp32`.
+#[repr(C, packed)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct X86MovsdDisp32 {
+    pub prefix: u8,      // 0xF2
+    pub opcode: [u8; 2], // [0x0F, 0x10]
+    pub modrm: u8,       // 0x05 (xmm0), 0x0D (xmm1), 0x15 (xmm2)
+    pub disp32: le::U32, // 32-bit absolute address in PE data section
+}
+
+impl X86MovsdDisp32 {
+    #[must_use]
+    pub fn is_valid_disp32(&self, base: usize, end: usize) -> bool {
+        let addr = self.disp32.get() as usize;
+        self.prefix == 0xF2
+            && self.opcode == [0x0F, 0x10]
+            && (self.modrm == 0x05 || self.modrm == 0x0D || self.modrm == 0x15)
+            && addr >= base
+            && addr.saturating_add(8) <= end
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<ImageDosHeader>() == 64);
+const _: () = assert!(std::mem::size_of::<ImageDataDirectory>() == 8);
+const _: () = assert!(std::mem::size_of::<ImageFileHeader>() == 20);
+const _: () = assert!(std::mem::size_of::<ImageOptionalHeader32>() == 224);
+const _: () = assert!(std::mem::size_of::<ImageNtHeaders32>() == 248);
+const _: () = assert!(std::mem::size_of::<ImageSectionHeader>() == 40);
+const _: () = assert!(std::mem::size_of::<ImageImportByNameHeader>() == 2);
 const _: () = assert!(std::mem::size_of::<ImageBaseRelocationBlock>() == 8);
 const _: () = assert!(std::mem::size_of::<ImageImportDescriptor>() == 20);
 const _: () = assert!(std::mem::size_of::<ImageExportDirectory>() == 40);
+const _: () = assert!(std::mem::size_of::<Win32Tib>() == 4096);
+const _: () = assert!(std::mem::size_of::<Win32CriticalSection>() == 24);
+const _: () = assert!(std::mem::size_of::<SpDeviceInterfaceDetailDataHeader>() == 4);
+const _: () = assert!(std::mem::size_of::<ZfxInterfaceWrapper>() == 8);
+const _: () = assert!(std::mem::size_of::<X86SubEspImm32>() == 6);
+const _: () = assert!(std::mem::size_of::<DongleBypassPatch>() == 6);
+const _: () = assert!(std::mem::size_of::<X86JmpRel32Nop>() == 6);
+const _: () = assert!(std::mem::size_of::<X86MovsdDisp32>() == 8);
 
 /// Represents our embedded, memory-mapped Windows DLL.
 pub struct PeModule {
@@ -209,16 +455,24 @@ impl PeModule {
         eprintln!("[peldr] Imports resolved successfully");
 
         // 6. Automatically patch hardware dongle check if present
-        // Signature: sub esp, 0x44c -> [0x81, 0xec, 0x4c, 0x04, 0x00, 0x00]
-        // Replacement: mov al, 1; ret; nop; nop; nop -> [0xb0, 0x01, 0xc3, 0x90, 0x90, 0x90]
-        // Note: The function is __cdecl, so caller cleans up the arguments with `add esp, 0x18`.
-        // A `ret` (0xc3) preserves stack balance, whereas `ret 8` corrupted the caller's stack frame!
-        let sig = [0x81u8, 0xec, 0x4c, 0x04, 0x00, 0x00];
-        let patch = [0xb0u8, 0x01, 0xc3, 0x90, 0x90, 0x90];
+        // Target Signature: sub esp, 0x44c
+        let dongle_sig = X86SubEspImm32 {
+            opcode: [0x81, 0xec],
+            imm32: le::U32::new(0x044c),
+        };
+        let dongle_patch = DongleBypassPatch {
+            mov_al_1: [0xb0, 0x01],
+            ret: 0xc3,
+            nops: [0x90, 0x90, 0x90],
+        };
         // SAFETY: Slicing the full mapped PE image memory to locate and patch dongle routine.
         let mem_slice = unsafe { std::slice::from_raw_parts_mut(base_ptr, size_of_image) };
-        if let Some(pos) = mem_slice.windows(sig.len()).position(|w| w == sig) {
-            mem_slice[pos..pos + patch.len()].copy_from_slice(&patch);
+        if let Some(pos) = mem_slice
+            .windows(std::mem::size_of::<X86SubEspImm32>())
+            .position(|w| w == dongle_sig.as_bytes())
+        {
+            mem_slice[pos..pos + std::mem::size_of::<DongleBypassPatch>()]
+                .copy_from_slice(dongle_patch.as_bytes());
             eprintln!("[peldr] Hardware dongle check bypassed at RVA {pos:#x}");
         }
 
@@ -235,16 +489,21 @@ impl PeModule {
             0x8bu8, 0xf3, 0xf3, 0x0f, 0x11, 0x04, 0x24, 0xe8, 0xdc, 0xed, 0xff, 0xff, 0x8b, 0x83,
             0xf4, 0x00, 0x00, 0x00,
         ];
-        let pitch_pedal_patch = [0xe9u8, 0x60, 0x00, 0x00, 0x00, 0x90];
+        let pitch_pedal_patch = X86JmpRel32Nop {
+            opcode: 0xe9,
+            rel32: le::I32::new(0x60),
+            nop: 0x90,
+        };
         if let Some(pos) = mem_slice
             .windows(pitch_pedal_sig.len())
             .position(|w| w == pitch_pedal_sig)
         {
-            mem_slice[pos + 12..pos + 12 + pitch_pedal_patch.len()]
-                .copy_from_slice(&pitch_pedal_patch);
+            let patch_start = pos + 12;
+            let patch_len = std::mem::size_of::<X86JmpRel32Nop>();
+            mem_slice[patch_start..patch_start + patch_len]
+                .copy_from_slice(pitch_pedal_patch.as_bytes());
             eprintln!(
-                "[peldr] Pedal_Pitch O(N^2) loop hot-patched at RVA {:#x} (live pitch tracking preserved)",
-                pos + 12
+                "[peldr] Pedal_Pitch O(N^2) loop hot-patched at RVA {patch_start:#x} (live pitch tracking preserved)"
             );
         }
 
@@ -257,21 +516,19 @@ impl PeModule {
     /// Applies base relocations from the .reloc directory
     // SAFETY: Relocation targets can be unaligned in raw PE sections; read_unaligned and write_unaligned are used.
     unsafe fn apply_relocations(base_ptr: *mut u8, raw_dll: &[u8], delta: isize) {
-        let pe_off =
-            usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
-        let opt_off = pe_off + 24;
-        // DataDirectory[5] is Base Relocation Table (offset 136 in optional header)
-        if opt_off + 144 > raw_dll.len() {
+        let Ok((dos_hdr, _)) = ImageDosHeader::ref_from_prefix(raw_dll) else {
             return;
-        }
-        let reloc_rva = usize::try_from(u32::from_le_bytes(
-            raw_dll[opt_off + 136..opt_off + 140].try_into().unwrap(),
-        ))
-        .unwrap();
-        let reloc_size = usize::try_from(u32::from_le_bytes(
-            raw_dll[opt_off + 140..opt_off + 144].try_into().unwrap(),
-        ))
-        .unwrap();
+        };
+        let pe_off = usize::try_from(dos_hdr.e_lfanew.get()).unwrap_or(0);
+        let Some(nt_slice) = raw_dll.get(pe_off..) else {
+            return;
+        };
+        let Ok((nt_hdr, _)) = ImageNtHeaders32::ref_from_prefix(nt_slice) else {
+            return;
+        };
+        let reloc_dir = &nt_hdr.optional_header.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        let reloc_rva = usize::try_from(reloc_dir.virtual_address.get()).unwrap_or(0);
+        let reloc_size = usize::try_from(reloc_dir.size.get()).unwrap_or(0);
 
         if reloc_rva == 0 || reloc_size == 0 {
             return;
@@ -311,21 +568,19 @@ impl PeModule {
     /// Resolves external Win32 / CRT functions into the Import Address Table (IAT)
     // SAFETY: Writing function pointers into pointer-aligned IAT slots.
     unsafe fn resolve_imports(base_ptr: *mut u8, raw_dll: &[u8]) {
-        let pe_off =
-            usize::try_from(u32::from_le_bytes(raw_dll[0x3c..0x40].try_into().unwrap())).unwrap();
-        let opt_off = pe_off + 24;
-        // DataDirectory[1] is Import Table (offset 104 in optional header)
-        if opt_off + 112 > raw_dll.len() {
+        let Ok((dos_hdr, _)) = ImageDosHeader::ref_from_prefix(raw_dll) else {
             return;
-        }
-        let imp_rva = usize::try_from(u32::from_le_bytes(
-            raw_dll[opt_off + 104..opt_off + 108].try_into().unwrap(),
-        ))
-        .unwrap();
-        let imp_size = usize::try_from(u32::from_le_bytes(
-            raw_dll[opt_off + 108..opt_off + 112].try_into().unwrap(),
-        ))
-        .unwrap();
+        };
+        let pe_off = usize::try_from(dos_hdr.e_lfanew.get()).unwrap_or(0);
+        let Some(nt_slice) = raw_dll.get(pe_off..) else {
+            return;
+        };
+        let Ok((nt_hdr, _)) = ImageNtHeaders32::ref_from_prefix(nt_slice) else {
+            return;
+        };
+        let imp_dir = &nt_hdr.optional_header.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        let imp_rva = usize::try_from(imp_dir.virtual_address.get()).unwrap_or(0);
+        let imp_size = usize::try_from(imp_dir.size.get()).unwrap_or(0);
 
         if imp_rva == 0 || imp_size == 0 {
             return;
@@ -363,9 +618,10 @@ impl PeModule {
                     // Import by name
                     let name_entry_rva = usize::try_from(thunk_entry).unwrap();
                     let name_entry_ptr = base_ptr.add(name_entry_rva);
+                    let name_ptr =
+                        name_entry_ptr.add(std::mem::size_of::<ImageImportByNameHeader>());
                     let func_name =
-                        CStr::from_ptr(name_entry_ptr.add(2).cast::<std::ffi::c_char>())
-                            .to_string_lossy();
+                        CStr::from_ptr(name_ptr.cast::<std::ffi::c_char>()).to_string_lossy();
 
                     let hook_ptr = resolve_import_symbol(&dll_name_str, &func_name);
                     eprintln!("[peldr import] {dll_name_str}!{func_name} -> {hook_ptr:?}");
@@ -384,13 +640,11 @@ impl PeModule {
         let base_ptr = self.base_addr.cast::<u8>();
         // SAFETY: Reading export directory and functions tables from mapped PE.
         unsafe {
-            let pe_off =
-                usize::try_from(ptr::read_unaligned(base_ptr.add(0x3c).cast::<u32>())).unwrap();
-            let opt_off = pe_off + 24;
-            let exp_rva = usize::try_from(ptr::read_unaligned(
-                base_ptr.add(opt_off + 96).cast::<u32>(),
-            ))
-            .unwrap();
+            let dos_hdr: ImageDosHeader = ptr::read_unaligned(base_ptr.cast());
+            let pe_off = usize::try_from(dos_hdr.e_lfanew.get()).ok()?;
+            let nt_hdr: ImageNtHeaders32 = ptr::read_unaligned(base_ptr.add(pe_off).cast());
+            let exp_dir = &nt_hdr.optional_header.data_directories[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            let exp_rva = usize::try_from(exp_dir.virtual_address.get()).ok()?;
             if exp_rva == 0 {
                 return None;
             }
@@ -467,9 +721,9 @@ impl PeModule {
             return Err("getinterface returned null pointer");
         }
 
-        let iface = instance.cast::<*mut c_void>();
-        // SAFETY: Reading AEffect pointer from second slot of Zfx iface wrapper.
-        let effect = unsafe { (*iface.add(1)).cast::<AEffect>() };
+        // SAFETY: Reading 8-byte ZfxInterfaceWrapper from verified non-null getinterface instance pointer.
+        let wrapper: ZfxInterfaceWrapper = unsafe { ptr::read_unaligned(instance.cast()) };
+        let effect = wrapper.effect_ptr.get() as *mut AEffect;
         if effect.is_null() {
             return Err("AEffect pointer is null");
         }
@@ -558,31 +812,30 @@ impl PeModule {
             let chunk = &mem[pos..pos.saturating_add(60).min(mem.len())];
             if let Some(je_rel) = chunk.windows(2).position(|w| w[0] == 0x74) {
                 let fb_sub = &chunk[je_rel + 2..];
-                if fb_sub.len() >= 8 && fb_sub[..4] == [0xf2, 0x0f, 0x10, 0x05] {
-                    let fb_addr =
-                        usize::try_from(u32::from_le_bytes(fb_sub[4..8].try_into().unwrap()))
-                            .unwrap_or(0);
-                    if let Some(jmp_rel) = fb_sub.windows(2).position(|w| w[0] == 0xeb) {
-                        let k48_sub = &fb_sub[jmp_rel + 2..];
-                        if k48_sub.len() >= 8 && k48_sub[..4] == [0xf2, 0x0f, 0x10, 0x05] {
-                            let k48_addr = usize::try_from(u32::from_le_bytes(
-                                k48_sub[4..8].try_into().unwrap(),
-                            ))
-                            .unwrap_or(0);
-                            if fb_addr >= base
-                                && fb_addr + 8 <= end
-                                && k48_addr >= base
-                                && k48_addr + 8 <= end
-                            {
-                                let fb_ptr = fb_addr as *mut f64;
-                                let k48_ptr = k48_addr as *const f64;
-                                // SAFETY: fb_ptr and k48_ptr verified within mapped PE module bounds.
-                                let base_48k_val = unsafe { *k48_ptr };
-                                eprintln!(
-                                    "[peldr] Detected WahMultiplier: fallback={fb_ptr:?}, k48={k48_ptr:?}, base={base_48k_val}"
-                                );
-                                adapter.legacy_wah_ptr = Some(fb_ptr);
-                                adapter.legacy_wah_base = base_48k_val;
+                if let Ok((fb_insn, _)) = X86MovsdDisp32::ref_from_prefix(fb_sub) {
+                    if fb_insn.modrm == 0x05 {
+                        let fb_addr = fb_insn.disp32.get() as usize;
+                        if let Some(jmp_rel) = fb_sub.windows(2).position(|w| w[0] == 0xeb) {
+                            let k48_sub = &fb_sub[jmp_rel + 2..];
+                            if let Ok((k48_insn, _)) = X86MovsdDisp32::ref_from_prefix(k48_sub) {
+                                if k48_insn.modrm == 0x05 {
+                                    let k48_addr = k48_insn.disp32.get() as usize;
+                                    if fb_addr >= base
+                                        && fb_addr + 8 <= end
+                                        && k48_addr >= base
+                                        && k48_addr + 8 <= end
+                                    {
+                                        let fb_ptr = fb_addr as *mut f64;
+                                        let k48_ptr = k48_addr as *const f64;
+                                        // SAFETY: fb_ptr and k48_ptr verified within mapped PE module bounds.
+                                        let base_48k_val = unsafe { *k48_ptr };
+                                        eprintln!(
+                                            "[peldr] Detected WahMultiplier: fallback={fb_ptr:?}, k48={k48_ptr:?}, base={base_48k_val}"
+                                        );
+                                        adapter.legacy_wah_ptr = Some(fb_ptr);
+                                        adapter.legacy_wah_base = base_48k_val;
+                                    }
+                                }
                             }
                         }
                     }
@@ -624,17 +877,9 @@ impl PeModule {
 
                 let mut fb_ptrs = Vec::new();
                 for i in 0..fb_block.len().saturating_sub(7) {
-                    let w = &fb_block[i..i + 4];
-                    if w == [0xf2, 0x0f, 0x10, 0x05]
-                        || w == [0xf2, 0x0f, 0x10, 0x0d]
-                        || w == [0xf2, 0x0f, 0x10, 0x15]
-                    {
-                        let addr = usize::try_from(u32::from_le_bytes(
-                            fb_block[i + 4..i + 8].try_into().unwrap(),
-                        ))
-                        .unwrap_or(0);
-                        if addr >= base && addr + 8 <= end {
-                            fb_ptrs.push(addr as *mut f64);
+                    if let Ok((insn, _)) = X86MovsdDisp32::ref_from_prefix(&fb_block[i..]) {
+                        if insn.is_valid_disp32(base, end) {
+                            fb_ptrs.push(insn.disp32.get() as *mut f64);
                         }
                     }
                 }
@@ -645,17 +890,9 @@ impl PeModule {
 
                 let mut k48_ptrs = Vec::new();
                 for i in 0..k48_block.len().saturating_sub(7) {
-                    let w = &k48_block[i..i + 4];
-                    if w == [0xf2, 0x0f, 0x10, 0x05]
-                        || w == [0xf2, 0x0f, 0x10, 0x0d]
-                        || w == [0xf2, 0x0f, 0x10, 0x15]
-                    {
-                        let addr = usize::try_from(u32::from_le_bytes(
-                            k48_block[i + 4..i + 8].try_into().unwrap(),
-                        ))
-                        .unwrap_or(0);
-                        if addr >= base && addr + 8 <= end {
-                            k48_ptrs.push(addr as *const f64);
+                    if let Ok((insn, _)) = X86MovsdDisp32::ref_from_prefix(&k48_block[i..]) {
+                        if insn.is_valid_disp32(base, end) {
+                            k48_ptrs.push(insn.disp32.get() as *const f64);
                         }
                     }
                 }
@@ -1374,15 +1611,13 @@ impl ZfxDspInstance {
                     for sub_off in (0x100..0x200).step_by(4) {
                         let p_sub = std::ptr::read_unaligned(obj_u8.add(sub_off).cast::<*mut u8>());
                         if is_plausible_heap_buf(p_sub as usize) {
-                            let sub_coeffs =
-                                std::ptr::read_unaligned(p_sub.add(0x40).cast::<Order5Coeffs>());
-                            if (4.0..5.5).contains(&sub_coeffs.a[0])
-                                && (0.5..0.98).contains(&sub_coeffs.a[4])
+                            let mut sub_obj =
+                                std::ptr::read_unaligned(p_sub.cast::<Order5SubObject>());
+                            if (4.0..5.5).contains(&sub_obj.coeffs.a[0])
+                                && (0.5..0.98).contains(&sub_obj.coeffs.a[4])
                             {
-                                std::ptr::write_unaligned(
-                                    p_sub.add(0x40).cast::<Order5Coeffs>(),
-                                    target_coeffs,
-                                );
+                                sub_obj.coeffs = target_coeffs;
+                                std::ptr::write_unaligned(p_sub.cast::<Order5SubObject>(), sub_obj);
                             }
                         }
                     }
@@ -1675,7 +1910,23 @@ struct UserDesc {
 }
 
 #[cfg(target_os = "linux")]
-static mut WIN32_TEB: [u32; 1024] = [0; 1024];
+static mut WIN32_TIB: Win32Tib = Win32Tib {
+    current_seh: le::U32::ZERO,
+    stack_base: le::U32::ZERO,
+    stack_limit: le::U32::ZERO,
+    sub_system_tib: le::U32::ZERO,
+    fiber_data: le::U32::ZERO,
+    arbitrary_user_data: le::U32::ZERO,
+    self_tib: le::U32::ZERO,
+    env_pointer: le::U32::ZERO,
+    process_id: le::U32::ZERO,
+    thread_id: le::U32::ZERO,
+    rpc_handle: le::U32::ZERO,
+    tls_array: le::U32::ZERO,
+    peb_ptr: le::U32::ZERO,
+    last_error: le::U32::ZERO,
+    padding: [0; 4096 - 0x38],
+};
 #[cfg(target_os = "linux")]
 static mut TEB_SELECTOR: u16 = 0;
 
@@ -1688,14 +1939,15 @@ pub fn init_win32_teb() {
             return;
         }
 
-        WIN32_TEB[0] = 0xFFFF_FFFF; // Head of SEH chain
-        WIN32_TEB[6] = u32::try_from((&raw const WIN32_TEB).addr()).unwrap(); // Self pointer at TEB+0x18
-        WIN32_TEB[8] = libc::getpid().cast_unsigned(); // Process ID at TEB+0x20
-        WIN32_TEB[9] = libc::pthread_self(); // Thread ID at TEB+0x24
+        let tib_addr = u32::try_from((&raw const WIN32_TIB).addr()).unwrap();
+        WIN32_TIB.current_seh = le::U32::new(0xFFFF_FFFF);
+        WIN32_TIB.self_tib = le::U32::new(tib_addr);
+        WIN32_TIB.process_id = le::U32::new(libc::getpid().cast_unsigned());
+        WIN32_TIB.thread_id = le::U32::new(libc::pthread_self());
 
         let mut desc = UserDesc {
             entry_number: 0xFFFF_FFFF,
-            base_addr: u32::try_from((&raw const WIN32_TEB).addr()).unwrap(),
+            base_addr: tib_addr,
             limit: 4096,
             flags: 1 | (1 << 6), // 32-bit segment + useable
         };
@@ -1820,7 +2072,8 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
 ) -> i32 {
     const SPOOFED_PATH: &[u8] =
         b"\\\\?\\usb#vid_1686&pid_0047#c51t#{a5dcbf10-11d2-6530-c000-1f90ed51b94f}\0";
-    let needed = u32::try_from(4 + SPOOFED_PATH.len()).unwrap_or(0);
+    let hdr_len = std::mem::size_of::<SpDeviceInterfaceDetailDataHeader>();
+    let needed = u32::try_from(hdr_len + SPOOFED_PATH.len()).unwrap_or(0);
 
     if !required_size.is_null() {
         // SAFETY: Writing required size to caller buffer.
@@ -1834,8 +2087,13 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
         let p = device_interface_detail_data.cast::<u8>();
         // SAFETY: Writing unaligned cbSize header and copying spoofed USB path.
         unsafe {
-            ptr::write_unaligned(p.cast::<u32>(), 5);
-            ptr::copy_nonoverlapping(SPOOFED_PATH.as_ptr(), p.add(4), SPOOFED_PATH.len());
+            ptr::write_unaligned(
+                p.cast::<SpDeviceInterfaceDetailDataHeader>(),
+                SpDeviceInterfaceDetailDataHeader {
+                    cb_size: le::U32::new(5),
+                },
+            );
+            ptr::copy_nonoverlapping(SPOOFED_PATH.as_ptr(), p.add(hdr_len), SPOOFED_PATH.len());
         }
     }
 
@@ -1894,9 +2152,19 @@ pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(
 #[no_mangle]
 pub const unsafe extern "stdcall" fn hook_InitializeCriticalSection(cs: *mut c_void) {
     if !cs.is_null() {
-        // SAFETY: Zeroing 24-byte Win32 CRITICAL_SECTION structure.
+        // SAFETY: Initializing 24-byte Win32 CRITICAL_SECTION structure.
         unsafe {
-            ptr::write_bytes(cs.cast::<u8>(), 0, 24);
+            ptr::write_unaligned(
+                cs.cast::<Win32CriticalSection>(),
+                Win32CriticalSection {
+                    debug_info: le::U32::ZERO,
+                    lock_count: le::I32::ZERO,
+                    recursion_count: le::I32::ZERO,
+                    owning_thread: le::U32::ZERO,
+                    lock_semaphore: le::U32::ZERO,
+                    spin_count: le::U32::ZERO,
+                },
+            );
         }
     }
 }

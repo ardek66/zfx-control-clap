@@ -3,7 +3,7 @@
 //! Provides type-safe representations of C++ filter coefficient blocks,
 //! circular delay descriptors, and sample-rate adapter state using `zerocopy`.
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{little_endian as le, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// 5th-order cabinet / speaker / waveshaping IIR filter layout (88 bytes).
 ///
@@ -16,6 +16,24 @@ pub struct Order5Coeffs {
     pub a: [f64; 5],
     pub b: [f64; 6],
 }
+
+/// Zoom 5th-Order Filter Sub-Object (e.g. at channel sub-objects in amplifiers).
+///
+/// Layout in 32-bit C++ heap object:
+/// - 0x00: vtable pointer (4 bytes)
+/// - 0x04: internal filter delay line history states `[f64; 7]` (56 bytes, 0x04..0x3C)
+/// - 0x3C: alignment padding (4 bytes)
+/// - 0x40: 5th-order cabinet / speaker IIR filter coefficients (88 bytes)
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct Order5SubObject {
+    pub vtable: le::U32,
+    pub history_states: [f64; 7],
+    pub pad_3c: [u8; 4],
+    pub coeffs: Order5Coeffs,
+}
+
+const _: () = assert!(std::mem::size_of::<Order5SubObject>() == 0x40 + 88);
 
 impl Order5Coeffs {
     /// Checks whether this coefficient block satisfies physical Zoom 5th-order cabinet filter invariants:
