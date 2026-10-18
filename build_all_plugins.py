@@ -208,6 +208,8 @@ def main():
                         help="Enable oversampling quality badge UI and host-rate resampler (feat_oversampling Cargo feature)")
     parser.add_argument("--enable-mic-ui", action="store_true",
                         help="Enable custom studio microphone egui panel for mic-category plugins (feat_mic_ui Cargo feature)")
+    parser.add_argument("--all-features", action="store_true",
+                        help="Enable all optional Cargo features (feat_oversampling, feat_mic_ui)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -215,9 +217,9 @@ def main():
 
     # Build up optional Cargo features list
     cargo_features = []
-    if args.enable_oversampling:
+    if args.all_features or args.enable_oversampling:
         cargo_features.append("feat_oversampling")
-    if args.enable_mic_ui:
+    if args.all_features or args.enable_mic_ui:
         cargo_features.append("feat_mic_ui")
     features_str = ",".join(cargo_features) if cargo_features else None
 
