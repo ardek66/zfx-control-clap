@@ -239,7 +239,7 @@ fn generate_asset_code(manifest_dir: &Path, plugin_name: &str) -> String {
         );
     }
     format!(
-        "#[must_use]\n#[allow(clippy::all, clippy::match_same_arms, clippy::too_many_lines, clippy::must_use_candidate)]\npub fn get_asset(path: &str) -> Option<&'static [u8]> {{\n    #[allow(clippy::all, clippy::match_same_arms)]\n    match path {{\n{arms}        _ => None,\n    }}\n}}"
+        "#[must_use]\n#[allow(clippy::all, clippy::match_same_arms, clippy::too_many_lines, clippy::must_use_candidate, clippy::missing_const_for_fn)]\npub fn get_asset(path: &str) -> Option<&'static [u8]> {{\n    #[allow(clippy::all, clippy::match_same_arms)]\n    match path {{\n{arms}        _ => None,\n    }}\n}}"
     )
 }
 
