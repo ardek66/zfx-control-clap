@@ -214,19 +214,16 @@ impl<'a> MemoryView<'a> {
                         .read_u32(off + 0x8)
                         .map_or(0, |p| usize::try_from(p).unwrap_or(0));
 
-                    let buf_off = if is_plausible_heap_buf(cand_buf_10) {
-                        Some(off + 0x10)
-                    } else if is_plausible_heap_buf(cand_buf_8) {
-                        Some(off + 0x8)
-                    } else {
-                        None
+                    let buf_off = match () {
+                        () if is_plausible_heap_buf(cand_buf_10) => Some(off + 0x10),
+                        () if is_plausible_heap_buf(cand_buf_8) => Some(off + 0x8),
+                        () => None,
                     };
 
                     if let Some(bo) = buf_off {
-                        let feedback_gain = if off >= 8 {
-                            self.read_f64(off - 8).filter(|&g| (0.5..0.99).contains(&g))
-                        } else {
-                            None
+                        let feedback_gain = match off {
+                            8.. => self.read_f64(off - 8).filter(|&g| (0.5..0.99).contains(&g)),
+                            _ => None,
                         };
 
                         return Some(CombFilterDescriptor {

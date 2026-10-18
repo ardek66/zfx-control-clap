@@ -599,17 +599,21 @@ impl PeModule {
             let mut hdr_len = 0usize;
 
             for (p, w) in chunk.windows(6).enumerate() {
-                if w[0] == 0x74 {
-                    je_pos = Some(p);
-                    target_rel = usize::from(w[1]);
-                    hdr_len = 2;
-                    break;
-                } else if w[0] == 0x0f && w[1] == 0x84 {
-                    je_pos = Some(p);
-                    target_rel = usize::try_from(u32::from_le_bytes(w[2..6].try_into().unwrap()))
-                        .unwrap_or(0);
-                    hdr_len = 6;
-                    break;
+                match w {
+                    [0x74, rel, ..] => {
+                        je_pos = Some(p);
+                        target_rel = usize::from(*rel);
+                        hdr_len = 2;
+                        break;
+                    }
+                    [0x0f, 0x84, b0, b1, b2, b3] => {
+                        je_pos = Some(p);
+                        target_rel = usize::try_from(u32::from_le_bytes([*b0, *b1, *b2, *b3]))
+                            .unwrap_or(0);
+                        hdr_len = 6;
+                        break;
+                    }
+                    _ => {}
                 }
             }
 
@@ -1056,14 +1060,13 @@ impl ZfxDspInstance {
         // Prepare 64-bit input buffers
         let in_f64: Vec<Vec<f64>> = (0..dsp_ins)
             .map(|ch| {
-                if inputs.is_empty() {
-                    vec![0.0f64; frames]
-                } else if ch < inputs.len() {
-                    inputs[ch].iter().map(|&s| f64::from(s)).collect()
-                } else {
-                    // If DSP requires channel 1 but host only provided channel 0, duplicate channel 0
-                    inputs[0].iter().map(|&s| f64::from(s)).collect()
-                }
+                inputs
+                    .get(ch)
+                    .or_else(|| inputs.first())
+                    .map_or_else(
+                        || vec![0.0f64; frames],
+                        |buf| buf.iter().map(|&s| f64::from(s)).collect(),
+                    )
             })
             .collect();
 

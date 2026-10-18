@@ -540,12 +540,10 @@ impl ZfxApp {
                     egui::Color32::from_rgb(20, 20, 24),
                 );
             } else {
-                let text_color = if is_hovered {
-                    egui::Color32::from_rgb(220, 225, 235)
-                } else if is_active {
-                    egui::Color32::from_rgb(140, 145, 155)
-                } else {
-                    egui::Color32::from_rgb(90, 95, 105)
+                let text_color = match (is_hovered, is_active) {
+                    (true, _) => egui::Color32::from_rgb(220, 225, 235),
+                    (false, true) => egui::Color32::from_rgb(140, 145, 155),
+                    (false, false) => egui::Color32::from_rgb(90, 95, 105),
                 };
                 ui.painter().text(
                     seg_rect.center(),
@@ -865,12 +863,12 @@ impl egui_baseview::App for ZfxApp {
 
             // Position Readout
             let offset_from_center = cur_sideways - 50.0;
-            let pos_desc = if offset_from_center.abs() < 4.0 {
-                "On-Axis Center".to_string()
-            } else if offset_from_center < 0.0 {
-                format!("{:.0}% Left Off-Axis", offset_from_center.abs() * 2.0)
-            } else {
-                format!("{:.0}% Right Off-Axis", offset_from_center * 2.0)
+            let pos_desc = match () {
+                () if offset_from_center.abs() < 4.0 => "On-Axis Center".to_string(),
+                () if offset_from_center < 0.0 => {
+                    format!("{:.0}% Left Off-Axis", offset_from_center.abs() * 2.0)
+                }
+                () => format!("{:.0}% Right Off-Axis", offset_from_center * 2.0),
             };
             ui.painter().text(
                 egui::pos2(win_w * 0.5, stage_rect.bottom() - 20.0),
@@ -1256,12 +1254,10 @@ impl egui_baseview::App for ZfxApp {
                             )
                         };
 
-                        let fader_frame = if total_frames <= 1 {
-                            0
-                        } else if total_frames == 2 {
-                            usize::from(response.dragged() || response.hovered())
-                        } else {
-                            frame_idx
+                        let fader_frame = match total_frames {
+                            0 | 1 => 0,
+                            2 => usize::from(response.dragged() || response.hovered()),
+                            _ => frame_idx,
                         };
 
                         if let Some(tex) =
@@ -1303,25 +1299,18 @@ impl egui_baseview::App for ZfxApp {
                             new_gui_events.push(GuiParamEvent::EndGesture(prm));
                         }
 
-                        let state_frame = if total_frames <= 1 {
-                            0
-                        } else if total_frames == 2 {
-                            usize::from(is_on)
-                        } else {
-                            frame_idx
+                        let state_frame = match total_frames {
+                            0 | 1 => 0,
+                            2 => usize::from(is_on),
+                            _ => frame_idx,
                         };
 
                         response.on_hover_ui(|ui| {
-                            let status = if ctrl.param_of_index.is_some() {
-                                if is_on {
-                                    "Selected"
-                                } else {
-                                    "Inactive"
-                                }
-                            } else if is_on {
-                                "ON"
-                            } else {
-                                "OFF"
+                            let status = match (ctrl.param_of_index.is_some(), is_on) {
+                                (true, true) => "Selected",
+                                (true, false) => "Inactive",
+                                (false, true) => "ON",
+                                (false, false) => "OFF",
                             };
                             ui.label(format!("{param_name}: {status}"));
                         });
@@ -1378,17 +1367,15 @@ impl egui_baseview::App for ZfxApp {
                         let cur_step =
                             ((norm * (steps - 1) as f64).round() as usize).min(steps - 1);
 
-                        if response.clicked() {
-                            let next_step = (cur_step + 1) % steps;
+                        let step_delta = match (response.clicked(), response.secondary_clicked()) {
+                            (true, _) => Some(1),
+                            (false, true) => Some(steps - 1),
+                            (false, false) => None,
+                        };
+
+                        if let Some(delta) = step_delta {
+                            let next_step = (cur_step + delta) % steps;
                             let new_val = (next_step as f64 / (steps - 1) as f64)
-                                .mul_add(max_val - min_val, min_val);
-                            new_gui_events.push(GuiParamEvent::BeginGesture(prm));
-                            param_updates.push((prm, new_val));
-                            new_gui_events.push(GuiParamEvent::SetValue(prm, new_val));
-                            new_gui_events.push(GuiParamEvent::EndGesture(prm));
-                        } else if response.secondary_clicked() {
-                            let prev_step = (cur_step + steps - 1) % steps;
-                            let new_val = (prev_step as f64 / (steps - 1) as f64)
                                 .mul_add(max_val - min_val, min_val);
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, new_val));
@@ -1397,7 +1384,7 @@ impl egui_baseview::App for ZfxApp {
                         }
 
                         response.on_hover_ui(|ui| {
-                            ui.label(format!("{}: Mode {}/{}", param_name, cur_step + 1, steps));
+                            ui.label(format!("{param_name}: Mode {}/{steps}", cur_step + 1));
                         });
 
                         if let Some(tex) = self.get_or_load_frame_texture(&ctx, &ctrl.img, cur_step)
@@ -1418,12 +1405,12 @@ impl egui_baseview::App for ZfxApp {
                         let response = ui.allocate_rect(ctrl_rect, egui::Sense::click());
                         if response.clicked() {
                             let delta = ctrl.delta.map_or(1.0, f64::from);
-                            let mut next_val = cur_val + delta;
-                            if next_val > max_val {
-                                next_val = min_val;
-                            } else if next_val < min_val {
-                                next_val = max_val;
-                            }
+                            let raw_next = cur_val + delta;
+                            let next_val = match () {
+                                () if raw_next > max_val => min_val,
+                                () if raw_next < min_val => max_val,
+                                () => raw_next,
+                            };
                             new_gui_events.push(GuiParamEvent::BeginGesture(prm));
                             param_updates.push((prm, next_val));
                             new_gui_events.push(GuiParamEvent::SetValue(prm, next_val));

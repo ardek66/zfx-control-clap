@@ -324,25 +324,20 @@ impl PluginMainThreadParams for ZfxMainThread<'_> {
             #[cfg(feature = "feat_oversampling")]
             PARAM_OVERSAMPLING => {
                 let lower = s.to_lowercase();
-                if lower.contains("4x") {
-                    Some(2.0)
-                } else if lower.contains("2x") {
-                    Some(1.0)
-                } else if lower.contains("1x") || lower.contains("off") {
-                    Some(0.0)
-                } else {
-                    s.parse::<f64>().ok()
+                match () {
+                    () if lower.contains("4x") => Some(2.0),
+                    () if lower.contains("2x") => Some(1.0),
+                    () if lower.contains("1x") || lower.contains("off") => Some(0.0),
+                    () => s.parse::<f64>().ok(),
                 }
             }
             #[cfg(feature = "feat_oversampling")]
             PARAM_OVERSAMPLING_METHOD => {
                 let lower = s.to_lowercase();
-                if lower.contains("lin") {
-                    Some(0.0)
-                } else if lower.contains("min") {
-                    Some(1.0)
-                } else {
-                    s.parse::<f64>().ok()
+                match () {
+                    () if lower.contains("lin") => Some(0.0),
+                    () if lower.contains("min") => Some(1.0),
+                    () => s.parse::<f64>().ok(),
                 }
             }
             _ => s.parse::<f64>().ok(),
@@ -1112,12 +1107,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                     .find(|p| p.id == 0)
                     .is_some_and(|param| {
                         let name_lower = param.name.to_lowercase();
-                        if name_lower.contains("bypass") {
-                            val >= 50.0 || val >= 0.5
-                        } else if name_lower.contains("on/off") || name_lower.contains("power") {
-                            val < 50.0
-                        } else {
-                            false
+                        match () {
+                            () if name_lower.contains("bypass") => val >= 50.0 || val >= 0.5,
+                            () if name_lower.contains("on/off") || name_lower.contains("power") => val < 50.0,
+                            () => false,
                         }
                     })
             });
@@ -1914,16 +1907,12 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
                     let id = ctrl.prm;
                     if id > 0 && seen_ids.insert(id) {
                         let (dll_name, init_norm) = get_bridge_param(id);
-                        let name = if !dll_name.is_empty() {
-                            format!("{dll_name}\0")
-                        } else if let Some(n) = &ctrl.name {
-                            if n.trim().is_empty() {
-                                format!("Param {id}\0")
-                            } else {
+                        let name = match (dll_name.is_empty(), &ctrl.name) {
+                            (false, _) => format!("{dll_name}\0"),
+                            (true, Some(n)) if !n.trim().is_empty() => {
                                 format!("{} (Prm {})\0", n.trim(), id)
                             }
-                        } else {
-                            format!("Param {id}\0")
+                            _ => format!("Param {id}\0"),
                         };
                         let max_raw = f64::from(ctrl.max.unwrap_or(100));
                         let max_val = if max_raw > 0.0 { max_raw } else { 100.0 };
@@ -1947,12 +1936,10 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
                 let dll_name = String::from_utf8_lossy(&p.name[..name_end])
                     .trim()
                     .to_string();
-                let name = if !dll_name.is_empty() {
-                    format!("{dll_name}\0")
-                } else if id == 0 {
-                    "Bypass\0".to_string()
-                } else {
-                    format!("Param {id}\0")
+                let name = match (dll_name.is_empty(), id) {
+                    (false, _) => format!("{dll_name}\0"),
+                    (true, 0) => "Bypass\0".to_string(),
+                    _ => format!("Param {id}\0"),
                 };
                 let init_norm = f64::from(p.default_val);
                 let default_val = (init_norm * 100.0).clamp(0.0, 100.0);
