@@ -1,5 +1,6 @@
 mod analog_proto;
 pub mod dsp_layout;
+pub mod log;
 mod peldr;
 mod protocol;
 
@@ -350,7 +351,7 @@ fn main() {
             )
         };
         if mapped == libc::MAP_FAILED {
-            eprintln!("[zfx-worker32] Failed to mmap shared memory fd {fd}");
+            worker_log!("[zfx-worker32] Failed to mmap shared memory fd {fd}");
             std::process::exit(1);
         }
         mapped
@@ -371,13 +372,13 @@ fn main() {
         // SAFETY: Opening named file mapping provided on command line by host process.
         let h_map = unsafe { OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, map_name_bytes.as_ptr()) };
         if h_map.is_null() {
-            eprintln!("[zfx-worker32] Failed to OpenFileMappingA {map_name}");
+            worker_log!("[zfx-worker32] Failed to OpenFileMappingA {map_name}");
             std::process::exit(1);
         }
         // SAFETY: Mapping shared memory view from file mapping handle.
         let mapped = unsafe { MapViewOfFile(h_map, FILE_MAP_ALL_ACCESS, 0, 0, bridge_size) };
         if mapped.Value.is_null() {
-            eprintln!("[zfx-worker32] Failed to MapViewOfFile for {map_name}");
+            worker_log!("[zfx-worker32] Failed to MapViewOfFile for {map_name}");
             std::process::exit(1);
         }
         mapped.Value
@@ -387,7 +388,7 @@ fn main() {
     let bridge = unsafe { &mut *addr.cast::<protocol::ZfxSharedBridge>() };
 
     if bridge.magic != protocol::BRIDGE_MAGIC {
-        eprintln!("[zfx-worker32] Bridge magic mismatch: {:#x}", bridge.magic);
+        worker_log!("[zfx-worker32] Bridge magic mismatch: {:#x}", bridge.magic);
         std::process::exit(2);
     }
 
@@ -445,7 +446,7 @@ fn main() {
                                         Some(inst_r)
                                     }
                                     Err(e) => {
-                                        eprintln!("[zfx-worker32] Failed to init secondary DSP instance: {e}");
+                                        worker_log!("[zfx-worker32] Failed to init secondary DSP instance: {e}");
                                         None
                                     }
                                 }
@@ -490,14 +491,14 @@ fn main() {
                             bridge.status.store(protocol::STATUS_OK, Ordering::Release);
                         }
                         Err(e) => {
-                            eprintln!("[zfx-worker32] init_zfx_plugin error: {e}");
+                            worker_log!("[zfx-worker32] init_zfx_plugin error: {e}");
                             bridge
                                 .status
                                 .store(protocol::STATUS_ERROR, Ordering::Release);
                         }
                     },
                     Err(e) => {
-                        eprintln!("[zfx-worker32] PeModule::load error: {e}");
+                        worker_log!("[zfx-worker32] PeModule::load error: {e}");
                         bridge
                             .status
                             .store(protocol::STATUS_ERROR, Ordering::Release);

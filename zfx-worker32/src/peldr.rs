@@ -438,21 +438,21 @@ impl PeModule {
             .addr()
             .cast_signed()
             .wrapping_sub(image_base.cast_signed());
-        eprintln!("[peldr] base_ptr={base_ptr:?}, image_base={image_base:#x}, delta={delta:#x}");
+        crate::worker_log!("[peldr] base_ptr={base_ptr:?}, image_base={image_base:#x}, delta={delta:#x}");
         if delta != 0 {
             // SAFETY: Applying relocations across valid mapped PE section memory.
             unsafe {
                 Self::apply_relocations(base_ptr, raw_dll_bytes, delta);
             }
         }
-        eprintln!("[peldr] Relocations applied successfully");
+        crate::worker_log!("[peldr] Relocations applied successfully");
 
         // 5. Resolve Imports into the IAT
         // SAFETY: Resolving imported Win32 and CRT functions into the mapped IAT.
         unsafe {
             Self::resolve_imports(base_ptr, raw_dll_bytes);
         }
-        eprintln!("[peldr] Imports resolved successfully");
+        crate::worker_log!("[peldr] Imports resolved successfully");
 
         // 6. Automatically patch hardware dongle check if present
         // Target Signature: sub esp, 0x44c
@@ -473,7 +473,7 @@ impl PeModule {
         {
             mem_slice[pos..pos + std::mem::size_of::<DongleBypassPatch>()]
                 .copy_from_slice(dongle_patch.as_bytes());
-            eprintln!("[peldr] Hardware dongle check bypassed at RVA {pos:#x}");
+            crate::worker_log!("[peldr] Hardware dongle check bypassed at RVA {pos:#x}");
         }
 
         // 7. Bypass redundant O(N^2) inner-loop envelope recalculation in Pedal_Pitch
@@ -502,7 +502,7 @@ impl PeModule {
             let patch_len = std::mem::size_of::<X86JmpRel32Nop>();
             mem_slice[patch_start..patch_start + patch_len]
                 .copy_from_slice(pitch_pedal_patch.as_bytes());
-            eprintln!(
+            crate::worker_log!(
                 "[peldr] Pedal_Pitch O(N^2) loop hot-patched at RVA {patch_start:#x} (live pitch tracking preserved)"
             );
         }
@@ -624,7 +624,7 @@ impl PeModule {
                         CStr::from_ptr(name_ptr.cast::<std::ffi::c_char>()).to_string_lossy();
 
                     let hook_ptr = resolve_import_symbol(&dll_name_str, &func_name);
-                    eprintln!("[peldr import] {dll_name_str}!{func_name} -> {hook_ptr:?}");
+                    crate::worker_log!("[peldr import] {dll_name_str}!{func_name} -> {hook_ptr:?}");
                     ptr::write_unaligned(base_ptr.add(iat_rva + slot_idx * 4).cast(), hook_ptr);
                 }
 
@@ -699,7 +699,7 @@ impl PeModule {
             .or_else(|| self.get_export("getinterface"))
             .ok_or("Failed to locate ZTypeIF or getinterface export in PE")?;
 
-        eprintln!("[peldr] Located getinterface export at {export_fn:?}");
+        crate::worker_log!("[peldr] Located getinterface export at {export_fn:?}");
 
         // Ensure Win32 TEB and FS segment register are initialized
         init_win32_teb();
@@ -710,13 +710,13 @@ impl PeModule {
 
         // SAFETY: Converting default_audio_master host callback function pointer to raw C pointer.
         let host_cb_ptr = default_audio_master as *const c_void;
-        eprintln!("[peldr] Calling getinterface({host_cb_ptr:?})...");
+        crate::worker_log!("[peldr] Calling getinterface({host_cb_ptr:?})...");
         // SAFETY: Invoking getinterface with default_audio_master host callback under Win32ContextGuard.
         let instance = unsafe {
             let _guard = Win32ContextGuard::enter();
             getinterface(host_cb_ptr)
         };
-        eprintln!("[peldr] Returned from getinterface: instance={instance:?}");
+        crate::worker_log!("[peldr] Returned from getinterface: instance={instance:?}");
         if instance.is_null() {
             return Err("getinterface returned null pointer");
         }
@@ -748,7 +748,7 @@ impl PeModule {
                         .windows(6)
                         .any(|w| w == [0x8b, 0x93, 0x28, 0x03, 0x00, 0x00])
                     {
-                        eprintln!("[peldr] Installed HpsPitchHelper at [obj + 0x328]");
+                        crate::worker_log!("[peldr] Installed HpsPitchHelper at [obj + 0x328]");
                         let helper = libc::malloc(std::mem::size_of::<HpsPitchHelper>()).cast::<HpsPitchHelper>();
                         if !helper.is_null() {
                             std::ptr::write(
@@ -829,7 +829,7 @@ impl PeModule {
                                         let k48_ptr = k48_addr as *const f64;
                                         // SAFETY: fb_ptr and k48_ptr verified within mapped PE module bounds.
                                         let base_48k_val = unsafe { *k48_ptr };
-                                        eprintln!(
+                                        crate::worker_log!(
                                             "[peldr] Detected WahMultiplier: fallback={fb_ptr:?}, k48={k48_ptr:?}, base={base_48k_val}"
                                         );
                                         adapter.legacy_wah_ptr = Some(fb_ptr);
@@ -910,7 +910,7 @@ impl PeModule {
                         } else {
                             (fb_ptrs[1], fb_ptrs[0], k48_val1, k48_val0)
                         };
-                        eprintln!(
+                        crate::worker_log!(
                             "[peldr] Detected PitchPoles: tracking={fb_tr:?} (base={base_tr}), splicing={fb_sp:?} (base={base_sp})"
                         );
                         adapter.legacy_pitch_ptrs = Some((fb_tr, fb_sp, base_tr, base_sp));
@@ -1025,13 +1025,13 @@ impl PeModule {
 
                     // Discover sample rate f64 offset
                     if let Some(off) = view_48.find_sr_f64(&view_44) {
-                        eprintln!("[peldr] Discovered sr_f64_offset at {off:#x}");
+                        crate::worker_log!("[peldr] Discovered sr_f64_offset at {off:#x}");
                         adapter.sr_f64_offset = Some(off);
                     }
 
                     // Discover sample rate i32 offset
                     if let Some(off) = view_48.find_sr_i32(&view_44) {
-                        eprintln!("[peldr] Discovered sr_i32_offset at {off:#x}");
+                        crate::worker_log!("[peldr] Discovered sr_i32_offset at {off:#x}");
                         adapter.sr_i32_offset = Some(off);
                     }
 
@@ -1042,7 +1042,7 @@ impl PeModule {
                         adapter.sr_f64_offset,
                         adapter.sr_i32_offset,
                     ) {
-                        eprintln!(
+                        crate::worker_log!(
                             "[peldr] Discovered comb_len_offset at {:#x} (48k={}, buf={:#x})",
                             comb.len_offset, comb.base_len, comb.buf_offset
                         );
@@ -1054,7 +1054,7 @@ impl PeModule {
 
                     // Discover 5th-order cabinet / tone filter
                     if let Some((off, coeffs)) = view_48.find_order5(&view_44, &view_96) {
-                        eprintln!(
+                        crate::worker_log!(
                             "[peldr] Discovered 5th-order filter at offset {off:#x} (A1={}, A5={}, B0={})",
                             coeffs.a[0], coeffs.a[4], coeffs.b[0]
                         );
@@ -1065,7 +1065,7 @@ impl PeModule {
 
                     // Discover wah multiplier offset
                     if let Some((off, v48)) = view_48.find_wah_multiplier(&view_44) {
-                        eprintln!(
+                        crate::worker_log!(
                             "[peldr] Discovered wah multiplier at offset {off:#x} (base_48k={v48})"
                         );
                         adapter.wah_offset = Some(off);
@@ -1354,7 +1354,7 @@ impl ZfxDspInstance {
         clippy::cast_ptr_alignment
     )]
     pub fn set_sample_rate(&self, sample_rate: f32) {
-        eprintln!("[peldr] set_sample_rate called with {sample_rate}");
+        crate::worker_log!("[peldr] set_sample_rate called with {sample_rate}");
         let sr_i32 = sample_rate as i32;
         CURRENT_SAMPLE_RATE.store(sr_i32, Ordering::Relaxed);
 
@@ -1512,14 +1512,14 @@ impl ZfxDspInstance {
                                         obj_u8.add(len_off).cast::<u32>(),
                                         new_len,
                                     );
-                                    eprintln!(
+                                    crate::worker_log!(
                                         "[peldr] Resized comb delay buffer: {current_len} -> {new_len} samples (base_48k={base_len})"
                                     );
                                 }
                             }
                         } else {
                             std::ptr::write_unaligned(obj_u8.add(len_off).cast::<u32>(), new_len);
-                            eprintln!(
+                            crate::worker_log!(
                                 "[peldr] Scaled inline comb/iter len: {current_len} -> {new_len} (base_48k={base_len})"
                             );
                         }
@@ -1777,7 +1777,7 @@ pub unsafe extern "C" fn default_audio_master(
     _ptr: *mut c_void,
     opt: f32,
 ) -> isize {
-    eprintln!("[default_audio_master] opcode={opcode}, index={index}, value={value}, opt={opt}");
+    crate::worker_log!("[default_audio_master] opcode={opcode}, index={index}, value={value}, opt={opt}");
     match opcode {
         1 => 2400, // audioMasterVersion (VST 2.4)
         7 => {
@@ -1893,7 +1893,7 @@ fn resolve_import_symbol(dll: &str, func: &str) -> *mut c_void {
         ("msvcr80.dll", "_adjust_fdiv") => (&raw mut ADJUST_FDIV).cast::<c_void>(),
 
         _ => {
-            eprintln!("[peldr] Warning: Unhandled import {dll}!{func}");
+            crate::worker_log!("[peldr] Warning: Unhandled import {dll}!{func}");
             hook_noop as *mut c_void
         }
     }
@@ -1957,9 +1957,9 @@ pub fn init_win32_teb() {
         if res == 0 {
             let sel = u16::try_from((desc.entry_number << 3) | 3).unwrap();
             TEB_SELECTOR = sel;
-            eprintln!("[peldr] Win32 TEB initialized successfully! Selector={sel:#x}");
+            crate::worker_log!("[peldr] Win32 TEB initialized successfully! Selector={sel:#x}");
         } else {
-            eprintln!("[peldr] Warning: SYS_set_thread_area returned {res}");
+            crate::worker_log!("[peldr] Warning: SYS_set_thread_area returned {res}");
         }
     }
     #[cfg(target_os = "windows")]
@@ -2031,7 +2031,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetClassDevsA(
     _hwnd_parent: *mut c_void,
     _flags: u32,
 ) -> *mut c_void {
-    eprintln!("[hook_SetupDiGetClassDevsA]");
+    crate::worker_log!("[hook_SetupDiGetClassDevsA]");
     ptr::without_provenance_mut(0x1337_0001)
 }
 
@@ -2043,7 +2043,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiEnumDeviceInterfaces(
     member_index: u32,
     device_interface_data: *mut c_void,
 ) -> i32 {
-    eprintln!("[hook_SetupDiEnumDeviceInterfaces] member_index={member_index}");
+    crate::worker_log!("[hook_SetupDiEnumDeviceInterfaces] member_index={member_index}");
     if member_index == 0 {
         if !device_interface_data.is_null() {
             // SP_DEVICE_INTERFACE_DATA: cbSize is at offset 0, Flags is at offset 20
@@ -2097,7 +2097,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceInterfaceDetailA(
         }
     }
 
-    eprintln!(
+    crate::worker_log!(
         "[hook_SetupDiGetDeviceInterfaceDetailA] size={device_interface_detail_data_size}, needed={needed}"
     );
     1 // TRUE
@@ -2114,7 +2114,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceRegistryPropertyA(
     required_size: *mut u32,
 ) -> i32 {
     const HARDWARE_ID: &[u8] = b"USB\\VID_1686&PID_0047\0\0";
-    eprintln!(
+    crate::worker_log!(
         "[hook_SetupDiGetDeviceRegistryPropertyA] prop={property}, buf_size={property_buffer_size}"
     );
     let id_len = u32::try_from(HARDWARE_ID.len()).unwrap_or(0);
@@ -2143,7 +2143,7 @@ pub unsafe extern "stdcall" fn hook_SetupDiGetDeviceRegistryPropertyA(
 pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(
     _device_info_set: *mut c_void,
 ) -> i32 {
-    eprintln!("[hook_SetupDiDestroyDeviceInfoList]");
+    crate::worker_log!("[hook_SetupDiDestroyDeviceInfoList]");
     1
 }
 
@@ -2633,5 +2633,5 @@ pub const unsafe extern "C" fn hook_dllonexit(
 
 #[no_mangle]
 pub unsafe extern "C" fn hook_purecall() {
-    eprintln!("[peldr] purecall called!");
+    crate::worker_log!("[peldr] purecall called!");
 }
