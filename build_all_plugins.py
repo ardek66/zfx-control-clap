@@ -7,30 +7,14 @@ shared library (.so) using the zfx-bootstrap engine, and packages each into a
 fully-compliant, solid .clap bundle structure.
 """
 
+import argparse
+import json
 import os
-import sys
+from pathlib import Path
 import shutil
 import subprocess
-import json
-import argparse
-from pathlib import Path
-
-# Paths relative to project root
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR
-ZFX_RESOURCES_DIR = PROJECT_ROOT / "wine_prefix" / "drive_c" / "Program Files (x86)" / "ZOOM" / "ZFX" / "resources"
-BOOTSTRAP_DIR = PROJECT_ROOT / "zfx-bootstrap"
-ASSETS_DIR = BOOTSTRAP_DIR / "assets"
-DEFAULT_OUT_DIR = PROJECT_ROOT / "clap_dist"
-
-import os
 import sys
 import time
-import shutil
-import subprocess
-import json
-import argparse
-from pathlib import Path
 
 # Paths relative to project root
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -46,6 +30,8 @@ INTERNAL_ROUTING_DLLS = {
 }
 
 def get_matching_asset_dir(plugin_name: str) -> Path | None:
+    if not ASSETS_DIR.exists():
+        return None
     direct = ASSETS_DIR / plugin_name
     if direct.is_dir():
         return direct
@@ -257,6 +243,11 @@ def main():
             install_dest.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             print(f"Warning: Could not create install destination {install_dest}: {e}")
+
+    if not ASSETS_DIR.exists() or not any(ASSETS_DIR.iterdir()):
+        print("[!] Note: zfx-bootstrap/assets/ not found or empty.")
+        print("    If you want embedded photorealistic textures and XML descriptors,")
+        print("    run first: python3 tools/extract_zfx_assets.py\n")
 
     print(f"=======================================================")
     print(f"  ZFX Suite Batch Generator (Dual-OS)")

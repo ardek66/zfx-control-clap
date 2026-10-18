@@ -12,3 +12,15 @@ __pycache__/
 /test2
 *.log
 /scratch/
+/assets/
+/zfx-bootstrap/assets/
+/reaper-c51t/
+/reaper-rs-src/
+*.pdf
+*.so
+*.dll
+*.zrc
+decompiled.c
+fcn000136b0.txt
+host_dll_imports.txt
+*.bundle
