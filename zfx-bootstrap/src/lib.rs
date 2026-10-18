@@ -738,7 +738,9 @@ pub struct ZfxAudioProcessor<'a> {
     pub oversampler: resampler::StereoOversampler,
     pub host_sample_rate: f64,
     pub seq: u32,
-    pub last_sent_params: std::collections::HashMap<u32, f32>,
+    /// Normalized values last sent to the worker. `f32::NAN` = never sent.
+    /// Parallel to `shared.params`.
+    pub last_sent_norm: Vec<f32>,
 }
 
 impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
@@ -775,7 +777,7 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
         let bridge_ptr = self.shared.bridge_ptr;
         if !bridge_ptr.is_null() {
             let mut num_chgs = 0;
-            for param in &self.shared.params {
+            for (idx, param) in self.shared.params.iter().enumerate() {
                 #[cfg(feature = "feat_oversampling")]
                 match param.id {
                     PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
@@ -789,9 +791,9 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
                         val.clamp(0.0, 1.0) as f32
                     };
 
-                    let changed = match self.last_sent_params.get(&param.id) {
-                        Some(&last) => (last - norm).abs() > 1e-5,
-                        None => true,
+                    let changed = match self.last_sent_norm.get(idx).copied() {
+                        Some(last) if last.is_finite() => (last - norm).abs() > 1e-5,
+                        _ => true,
                     };
 
                     if changed && num_chgs < protocol::MAX_PARAM_QUEUE {
@@ -803,7 +805,9 @@ impl PluginAudioProcessorParams for ZfxAudioProcessor<'_> {
                             };
                         }
                         num_chgs += 1;
-                        self.last_sent_params.insert(param.id, norm);
+                        if let Some(slot) = self.last_sent_norm.get_mut(idx) {
+                            *slot = norm;
+                        }
                     }
                 }
             }
@@ -875,7 +879,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         shared: &'a ZfxShared,
         config: PluginAudioConfiguration,
     ) -> Result<Self, PluginError> {
-        let max_frames = (config.max_frames_count as usize).max(4096);
+        let max_frames = (config.max_frames_count as usize).clamp(4096, protocol::MAX_FRAMES);
 
         let bridge_ptr = shared.bridge_ptr;
         if !bridge_ptr.is_null() {
@@ -906,7 +910,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         shared.is_active.store(true, Ordering::Release);
 
         #[cfg(feature = "feat_oversampling")]
-        let max_os_frames = max_frames * 4;
+        let max_os_frames = (max_frames * 4).min(protocol::MAX_FRAMES);
         #[cfg(feature = "feat_oversampling")]
         let oversampler = {
             let mut s = resampler::StereoOversampler::new(
@@ -935,7 +939,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             oversampler,
             host_sample_rate: config.sample_rate,
             seq: 1,
-            last_sent_params: std::collections::HashMap::new(),
+            last_sent_norm: vec![f32::NAN; shared.params.len()],
         })
     }
 
@@ -976,7 +980,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             let cur_mode = self.shared.oversampling_mode();
             let cur_phase = self.shared.oversampling_phase();
             if self.oversampler.mode() != cur_mode || self.oversampler.phase() != cur_phase {
-                self.last_sent_params.clear(); // Force full parameter resync to prevent any bypass or state drop
+                self.last_sent_norm.fill(f32::NAN); // Force full parameter resync
                 self.oversampler.set_config(cur_mode, cur_phase);
             }
         }
@@ -1008,7 +1012,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
 
             // Synchronize changed parameters to shared bridge
             let mut num_chgs = 0;
-            for param in &self.shared.params {
+            for (idx, param) in self.shared.params.iter().enumerate() {
                 #[cfg(feature = "feat_oversampling")]
                 match param.id {
                     PARAM_OVERSAMPLING | PARAM_OVERSAMPLING_METHOD => continue,
@@ -1022,9 +1026,9 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         val.clamp(0.0, 1.0) as f32
                     };
 
-                    let changed = match self.last_sent_params.get(&param.id) {
-                        Some(&last) => (last - norm).abs() > 1e-5,
-                        None => true,
+                    let changed = match self.last_sent_norm.get(idx).copied() {
+                        Some(last) if last.is_finite() => (last - norm).abs() > 1e-5,
+                        _ => true,
                     };
 
                     if changed && num_chgs < protocol::MAX_PARAM_QUEUE {
@@ -1036,7 +1040,9 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                             };
                         }
                         num_chgs += 1;
-                        self.last_sent_params.insert(param.id, norm);
+                        if let Some(slot) = self.last_sent_norm.get_mut(idx) {
+                            *slot = norm;
+                        }
                     }
                 }
             }
@@ -1084,47 +1090,39 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         match pair {
                             clack_plugin::process::audio::ChannelPair::InputOnly(in_buf)
                             | clack_plugin::process::audio::ChannelPair::InputOutput(in_buf, _) => {
-                                frames = in_buf.len();
+                                frames = in_buf.len().min(self.in_l.len());
                                 match ch {
                                     0 => {
-                                        if self.in_l.len() < frames {
-                                            self.in_l.resize(frames, 0.0);
-                                        }
-                                        self.in_l[..frames].copy_from_slice(in_buf);
+                                        self.in_l[..frames].copy_from_slice(&in_buf[..frames]);
                                     }
                                     1 => {
-                                        if self.in_r.len() < frames {
-                                            self.in_r.resize(frames, 0.0);
-                                        }
-                                        self.in_r[..frames].copy_from_slice(in_buf);
+                                        frames = frames.min(self.in_r.len());
+                                        self.in_r[..frames].copy_from_slice(&in_buf[..frames]);
                                     }
                                     _ => {}
                                 }
                             }
                             clack_plugin::process::audio::ChannelPair::InPlace(buf) => {
-                                frames = buf.len();
+                                frames = buf.len().min(self.in_l.len());
                                 match ch {
                                     0 => {
-                                        if self.in_l.len() < frames {
-                                            self.in_l.resize(frames, 0.0);
-                                        }
-                                        self.in_l[..frames].copy_from_slice(buf);
+                                        self.in_l[..frames].copy_from_slice(&buf[..frames]);
                                     }
                                     1 => {
-                                        if self.in_r.len() < frames {
-                                            self.in_r.resize(frames, 0.0);
-                                        }
-                                        self.in_r[..frames].copy_from_slice(buf);
+                                        frames = frames.min(self.in_r.len());
+                                        self.in_r[..frames].copy_from_slice(&buf[..frames]);
                                     }
                                     _ => {}
                                 }
                             }
                             clack_plugin::process::audio::ChannelPair::OutputOnly(buf) => {
-                                frames = buf.len();
+                                frames = buf.len().min(self.out_l.len());
                             }
                         }
                     }
                 }
+                frames = frames.min(self.out_l.len()).min(self.out_r.len());
+
                 if is_bypassed {
                     // True Software Passthrough: Bit-exact dry audio when bypassed
                     for (ch, pair) in pairs[..num_pairs].iter_mut().enumerate() {
@@ -1161,13 +1159,9 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                             (frames, false)
                         } else {
                             let factor = cur_mode.factor();
-                            let of = frames * factor;
-                            if self.os_in_l.len() < of {
-                                self.os_in_l.resize(of, 0.0);
-                            }
-                            if self.os_in_r.len() < of {
-                                self.os_in_r.resize(of, 0.0);
-                            }
+                            let of = (frames * factor)
+                                .min(self.os_in_l.len())
+                                .min(self.os_in_r.len());
                             self.oversampler.upsample(
                                 &self.in_l[..frames],
                                 &self.in_r[..frames],
@@ -1231,6 +1225,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         protocol::futex_wake(&raw const bridge.host_seq);
 
                         // Low-latency hybrid spin + futex wait
+                        let mut timed_out = false;
                         let mut spins = 0;
                         loop {
                             let wseq = bridge.worker_seq.load(Ordering::Acquire);
@@ -1245,7 +1240,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                                     Some(5_000),
                                 );
                                 if spins > 1050 {
-                                    eprintln!("[zfx-bootstrap] Warning: Audio process futex timeout after spins={spins}");
+                                    timed_out = true;
                                     break;
                                 }
                             } else {
@@ -1253,89 +1248,80 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                             }
                         }
 
-                        #[cfg(feature = "feat_oversampling")]
-                        if use_oversampling {
-                            if self.os_out_l.len() < clamped_dsp_frames {
-                                self.os_out_l.resize(clamped_dsp_frames, 0.0);
-                            }
-                            if self.os_out_r.len() < clamped_dsp_frames {
-                                self.os_out_r.resize(clamped_dsp_frames, 0.0);
+                        if timed_out {
+                            self.out_l[..frames].fill(0.0);
+                            self.out_r[..frames].fill(0.0);
+                        } else {
+                            #[cfg(feature = "feat_oversampling")]
+                            if use_oversampling {
+                                let os_frames = clamped_dsp_frames
+                                    .min(self.os_out_l.len())
+                                    .min(self.os_out_r.len());
+
+                                for (dst, &src) in self.os_out_l[..os_frames]
+                                    .iter_mut()
+                                    .zip(&bridge.out_l[..os_frames])
+                                {
+                                    *dst = if src.is_finite() {
+                                        src.clamp(-4.0, 4.0)
+                                    } else {
+                                        0.0
+                                    };
+                                }
+
+                                for (dst, &src) in self.os_out_r[..os_frames]
+                                    .iter_mut()
+                                    .zip(&bridge.out_r[..os_frames])
+                                {
+                                    *dst = if src.is_finite() {
+                                        src.clamp(-4.0, 4.0)
+                                    } else {
+                                        0.0
+                                    };
+                                }
+
+                                // Downsample oversampled DSP audio back to host rate
+                                self.oversampler.downsample(
+                                    &self.os_out_l[..os_frames],
+                                    &self.os_out_r[..os_frames],
+                                    &mut self.out_l[..frames],
+                                    &mut self.out_r[..frames],
+                                );
                             }
 
-                            for (dst, &src) in self.os_out_l[..clamped_dsp_frames]
-                                .iter_mut()
-                                .zip(&bridge.out_l[..clamped_dsp_frames])
-                            {
-                                *dst = if src.is_finite() {
-                                    src.clamp(-4.0, 4.0)
-                                } else {
-                                    0.0
-                                };
-                            }
+                            #[cfg(feature = "feat_oversampling")]
+                            let needs_direct_copy = !use_oversampling;
+                            #[cfg(not(feature = "feat_oversampling"))]
+                            let needs_direct_copy = true;
 
-                            for (dst, &src) in self.os_out_r[..clamped_dsp_frames]
-                                .iter_mut()
-                                .zip(&bridge.out_r[..clamped_dsp_frames])
-                            {
-                                *dst = if src.is_finite() {
-                                    src.clamp(-4.0, 4.0)
-                                } else {
-                                    0.0
-                                };
-                            }
+                            if needs_direct_copy {
+                                let copy_frames = clamped_dsp_frames
+                                    .min(self.out_l.len())
+                                    .min(self.out_r.len());
 
-                            if self.out_l.len() < frames {
-                                self.out_l.resize(frames, 0.0);
-                            }
-                            if self.out_r.len() < frames {
-                                self.out_r.resize(frames, 0.0);
-                            }
+                                for (dst, &src) in self.out_l[..copy_frames]
+                                    .iter_mut()
+                                    .zip(&bridge.out_l[..copy_frames])
+                                {
+                                    *dst = if src.is_finite() {
+                                        src.clamp(-4.0, 4.0)
+                                    } else {
+                                        0.0
+                                    };
+                                }
 
-                            // Downsample oversampled DSP audio back to host rate
-                            self.oversampler.downsample(
-                                &self.os_out_l[..clamped_dsp_frames],
-                                &self.os_out_r[..clamped_dsp_frames],
-                                &mut self.out_l[..frames],
-                                &mut self.out_r[..frames],
-                            );
-                        }
-
-                        #[cfg(feature = "feat_oversampling")]
-                        let needs_direct_copy = !use_oversampling;
-                        #[cfg(not(feature = "feat_oversampling"))]
-                        let needs_direct_copy = true;
-
-                        if needs_direct_copy {
-                            if self.out_l.len() < clamped_dsp_frames {
-                                self.out_l.resize(clamped_dsp_frames, 0.0);
-                            }
-                            if self.out_r.len() < clamped_dsp_frames {
-                                self.out_r.resize(clamped_dsp_frames, 0.0);
-                            }
-
-                            for (dst, &src) in self.out_l[..clamped_dsp_frames]
-                                .iter_mut()
-                                .zip(&bridge.out_l[..clamped_dsp_frames])
-                            {
-                                *dst = if src.is_finite() {
-                                    src.clamp(-4.0, 4.0)
-                                } else {
-                                    0.0
-                                };
-                            }
-
-                            for (dst, &src) in self.out_r[..clamped_dsp_frames]
-                                .iter_mut()
-                                .zip(&bridge.out_r[..clamped_dsp_frames])
-                            {
-                                *dst = if src.is_finite() {
-                                    src.clamp(-4.0, 4.0)
-                                } else {
-                                    0.0
-                                };
+                                for (dst, &src) in self.out_r[..copy_frames]
+                                    .iter_mut()
+                                    .zip(&bridge.out_r[..copy_frames])
+                                {
+                                    *dst = if src.is_finite() {
+                                        src.clamp(-4.0, 4.0)
+                                    } else {
+                                        0.0
+                                    };
+                                }
                             }
                         }
-
                     }
                 }
 
