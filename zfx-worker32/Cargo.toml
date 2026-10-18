@@ -9,6 +9,7 @@ goblin = "0.8"
 libc = "0.2"
 once_cell = "1.19"
 zerocopy = { version = "0.8", features = ["derive"] }
+zfx-protocol = { path = "../zfx-protocol" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

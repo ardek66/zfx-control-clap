@@ -1,0 +1,25 @@
+[package]
+name = "zfx-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Shared-memory IPC protocol between zfx-bootstrap and zfx-worker32"
+publish = false
+
+[dependencies]
+libc = "0.2"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[workspace]
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

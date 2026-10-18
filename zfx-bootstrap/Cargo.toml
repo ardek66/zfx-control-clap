@@ -42,6 +42,7 @@ quick-xml = { version = "0.42.0", features = ["serialize"] }
 raw-window-handle = "0.6.2"
 serde = { version = "1.0.229", features = ["derive"] }
 zerocopy = { version = "0.8", features = ["derive"] }
+zfx-protocol = { path = "../zfx-protocol" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

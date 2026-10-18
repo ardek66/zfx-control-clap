@@ -192,6 +192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zfx-protocol"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+ "zerocopy",
+]
+
+[[package]]
 name = "zfx-worker32"
 version = "0.1.0"
 dependencies = [
@@ -201,4 +210,5 @@ dependencies = [
  "once_cell",
  "windows-sys",
  "zerocopy",
+ "zfx-protocol",
 ]
