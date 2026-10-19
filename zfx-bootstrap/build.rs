@@ -295,6 +295,16 @@ fn main() {
         .unwrap_or_else(|_| format!("com.idf.zfx.{}", plugin_name.to_lowercase()));
     let category = env::var("ZFX_PLUGIN_CATEGORY").unwrap_or_else(|_| "effect".to_string());
 
+    let assets_root = manifest_dir.join("assets");
+    println!(
+        "cargo:rerun-if-changed={}",
+        assets_root.join(&plugin_name).display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        assets_root.join("Common").display()
+    );
+
     let dll_path = resolve_dll_path(&manifest_dir, &plugin_name);
     let worker_path = resolve_worker_path(&manifest_dir);
     if !worker_path.is_empty() {

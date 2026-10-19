@@ -18,6 +18,63 @@ import sys
 from pathlib import Path
 
 
+# VER1000 directory record: 512-byte name, child count, size, marker.
+# A file child is 528 bytes (offset, size, extra, flags). A directory child is
+# 524 bytes (offset, size, extra). Payload address is record_position + offset - 4.
+_DIR_RECORD = 524
+_FILE_RECORD = 528
+_NAME_FIELD = 512
+
+
+def _record_name(data: bytes, pos: int) -> str:
+    raw = data[pos : pos + _NAME_FIELD].split(b"\x00", 1)[0]
+    return raw.decode("ascii", errors="ignore")
+
+
+def _safe_relpath(name: str) -> Path | None:
+    parts = [part for part in name.replace("\\", "/").split("/") if part not in ("", ".", "..")]
+    while parts and parts[0].lower() in {"root", "resource"}:
+        parts = parts[1:]
+    if not parts:
+        return None
+    for part in parts:
+        if not all(ch.isalnum() or ch in "._- " for ch in part):
+            return None
+    path = Path(*parts)
+    stem, dot, ext = path.name.rpartition(".")
+    if dot:
+        path = path.with_name(stem + dot + ext.lower())
+    return path
+
+
+def _walk_zrc(data: bytes, pos: int, prefix: str, out: list[tuple[Path, bytes]]) -> None:
+    if pos < 0 or pos + _DIR_RECORD > len(data):
+        return
+    count = struct.unpack_from("<I", data, pos + _NAME_FIELD)[0]
+    if count > 4096:
+        return
+    child = pos + _DIR_RECORD
+    for _ in range(count):
+        if child + _DIR_RECORD > len(data):
+            return
+        name = _record_name(data, child)
+        if not name or any(ch.isalnum() is False and ch not in "._- /\\" for ch in name):
+            return
+        offset, size, _extra = struct.unpack_from("<III", data, child + _NAME_FIELD)
+        target = child + offset - 4
+        if "." in name:
+            rel = _safe_relpath(prefix + name)
+            if rel is not None and size > 0 and 0 <= target <= len(data) - size:
+                blob = data[target : target + size]
+                if blob.startswith(b"\xef\xbb\xbf"):
+                    blob = blob[3:]
+                out.append((rel, blob))
+            child += _FILE_RECORD
+        else:
+            _walk_zrc(data, target, f"{prefix}{name}/", out)
+            child += _DIR_RECORD
+
+
 def parse_zrc_file(zrc_path: Path, out_dir: Path) -> int:
     """Parses a single .zrc archive and extracts all valid images and XMLs."""
     try:
@@ -30,41 +87,25 @@ def parse_zrc_file(zrc_path: Path, out_dir: Path) -> int:
         print(f"[-] {zrc_path.name} is not a valid ZOOM ZFX archive (magic mismatch)", file=sys.stderr)
         return 0
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    extracted_count = 0
-    data_len = len(data)
+    found: list[tuple[Path, bytes]] = []
+    _walk_zrc(data, 56, "", found)
 
-    # Scan for file records: struct layout [size: u32, offset: u32, unk: u32, ftype: u32, name: [u8; ...]]
-    for i in range(0, data_len - 0x100, 4):
-        size, offset, _unk, ftype = struct.unpack_from("<IIII", data, i)
-
-        # ftype 2 = file record
-        if ftype == 2 and 0 < offset < data_len and (offset + size) <= data_len and size > 0:
-            name_bytes = data[i + 16 : i + 16 + 256]
-            name_end = name_bytes.find(b"\x00")
-            if name_end <= 0:
-                continue
-
-            name = name_bytes[:name_end].decode("ascii", errors="ignore")
-            # Enforce clean filename constraints
-            if not all(c.isalnum() or c in "._- " for c in name):
-                continue
-
-            file_data = data[offset : offset + size]
-
-            # Validation heuristics
-            if name.endswith(".xml") and not (file_data.startswith(b"<?xml") or file_data.startswith(b"\xef\xbb\xbf<?xml")):
-                continue
-            if name.endswith(".png") and not file_data.startswith(b"\x89PNG"):
-                continue
-            if name.endswith(".jpg") and not file_data.startswith(b"\xff\xd8"):
-                continue
-
-            out_file = out_dir / name
-            out_file.write_bytes(file_data)
-            extracted_count += 1
-
-    return extracted_count
+    written = 0
+    for rel, blob in found:
+        suffix = rel.suffix
+        if suffix == ".xml" and not blob.startswith(b"<?xml"):
+            continue
+        if suffix == ".png" and not blob.startswith(b"\x89PNG"):
+            continue
+        if suffix in {".jpg", ".jpeg"} and not blob.startswith(b"\xff\xd8"):
+            continue
+        if suffix not in {".xml", ".png", ".jpg", ".jpeg"}:
+            continue
+        dest = out_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob)
+        written += 1
+    return written
 
 
 def find_resources_dir(hint: Path | None) -> Path | None:
