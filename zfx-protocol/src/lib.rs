@@ -229,30 +229,20 @@ impl ZfxSharedBridge {
 
     /// Wait until the worker has finished every block up through `target`.
     ///
-    /// Returns `false` if that has not happened within `timeout_us`, so a stuck
-    /// DLL cannot hold the audio callback. The caller may run on the audio thread.
+    /// Checks once, then sleeps in the kernel at most once for up to
+    /// `timeout_us`. Returns `false` on timeout so a stuck DLL cannot hold the
+    /// audio callback. The caller may run on the audio thread.
     pub fn wait_done(&self, target: u32, timeout_us: u64) -> bool {
-        for _ in 0..32 {
-            if seq_reached(self.done_seq.load(Ordering::Acquire), target) {
-                return true;
-            }
-            core::hint::spin_loop();
+        let done = self.done_seq.load(Ordering::Acquire);
+        if seq_reached(done, target) {
+            return true;
         }
-        let start = std::time::Instant::now();
-        let budget = std::time::Duration::from_micros(timeout_us);
-        loop {
-            let done = self.done_seq.load(Ordering::Acquire);
-            if seq_reached(done, target) {
-                return true;
-            }
-            let elapsed = start.elapsed();
-            let Some(left) = budget.checked_sub(elapsed) else {
-                return false;
-            };
-            let remain = u64::try_from(left.as_micros()).unwrap_or(1);
-            // SAFETY: `done_seq` is an aligned atomic in this bridge allocation.
-            unsafe { futex_wait(&raw const self.done_seq, done, Some(remain.max(1))) }
+        if timeout_us == 0 {
+            return false;
         }
+        // SAFETY: `done_seq` is an aligned atomic in this bridge allocation.
+        unsafe { futex_wait(&raw const self.done_seq, done, Some(timeout_us)) }
+        seq_reached(self.done_seq.load(Ordering::Acquire), target)
     }
 
     /// Drop finished blocks without copying them. Used while bypassed.

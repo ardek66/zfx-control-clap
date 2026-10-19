@@ -857,12 +857,9 @@ pub struct ZfxAudioProcessor<'a> {
     host: HostAudioProcessorHandle<'a>,
     /// Blocks this processor has copied back from the worker.
     pub collected: u32,
-    /// Device block size once playback has settled. A later jump well above
-    /// this is an extended host block.
+    /// Last steady device block size. Larger host callbacks pipeline instead
+    /// of updating this, so anticipative chunks do not raise the wait budget.
     live_block: u32,
-    live_seen: u32,
-    /// Largest extended block currently being pipelined.
-    extended_block: u32,
     bypass: BypassMode,
     /// Normalized values last sent to the worker. `f32::NAN` = never sent.
     /// Parallel to `shared.params`.
@@ -1013,16 +1010,22 @@ impl ZfxAudioProcessor<'_> {
         }
     }
 
-    /// How long this block is allowed to occupy the audio callback.
+    /// Whole microseconds in one device block: `frames * 1e6 / sample_rate`,
+    /// truncated. Uses the settled live size when known so a larger host chunk
+    /// does not lengthen the wait.
     fn block_budget_us(&self, frames: u32) -> u64 {
-        let rate = if self.host_sample_rate.is_finite() && self.host_sample_rate > 1.0 {
-            self.host_sample_rate
+        #[allow(clippy::cast_possible_truncation)]
+        let rate_hz = if self.host_sample_rate.is_finite() && self.host_sample_rate > 1.0 {
+            self.host_sample_rate.round().max(1.0) as u64
         } else {
-            48_000.0
+            48_000
         };
-        let us = (f64::from(frames) * 1_000_000.0 / rate).ceil();
-        let us = us.clamp(250.0, 200_000.0);
-        us as u64
+        let sized = if self.live_block > 0 {
+            u64::from(self.live_block.min(frames.max(1)))
+        } else {
+            u64::from(frames.max(1))
+        };
+        sized.saturating_mul(1_000_000) / rate_hz
     }
 
     fn set_block_latency(&self, samples: u32) {
@@ -1033,41 +1036,36 @@ impl ZfxAudioProcessor<'_> {
         }
     }
 
-    /// `true` when this callback's block is large enough that the worker should
-    /// keep it for the next callback instead of risking a dropped buffer.
+    fn note_live_miss(&self, frames: u32) {
+        let samples = if self.live_block > 0 {
+            self.live_block
+        } else {
+            frames
+        };
+        self.set_block_latency(samples.max(1));
+    }
+
+    fn note_pipeline_success(&self) {
+        self.set_block_latency(0);
+    }
+
+    /// `true` when this callback should play the previous finished block and
+    /// hold the new one (host grew past live size, or a live wait miss).
     fn observe_block(&mut self, frames: u32) -> bool {
         if frames == 0 {
             return self.shared.block_latency.load(Ordering::Acquire) > 0;
         }
         if self.live_block == 0 {
             self.live_block = frames;
-            self.live_seen = 1;
             return false;
         }
-        let pipelined = self.shared.block_latency.load(Ordering::Acquire) > 0;
-        if !pipelined
-            && self.live_seen < 2
-            && frames > self.live_block
-            && frames <= self.live_block.saturating_mul(4)
-        {
+        if frames < self.live_block {
             self.live_block = frames;
-            self.live_seen = 1;
-            return false;
-        }
-        if frames > self.live_block.saturating_mul(2) {
-            self.extended_block = self.extended_block.max(frames);
-            self.set_block_latency(self.extended_block);
+        } else if frames > self.live_block {
+            self.set_block_latency(frames);
             return true;
         }
-        if pipelined && frames > self.live_block {
-            return true;
-        }
-        if frames == self.live_block {
-            self.live_seen = self.live_seen.saturating_add(1);
-        }
-        self.extended_block = 0;
-        self.set_block_latency(0);
-        false
+        self.shared.block_latency.load(Ordering::Acquire) > 0
     }
 
     /// Copy the finished block into `out_l` / `out_r`. Missing audio stays silent.
@@ -1270,8 +1268,6 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             host,
             collected,
             live_block: 0,
-            live_seen: 0,
-            extended_block: 0,
             bypass: BypassMode::resolve(&shared.params),
             last_sent_norm: vec![f32::NAN; shared.params.len()],
         })
@@ -1523,11 +1519,19 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         };
                         if published {
                             self.commit_params(&batch);
-                            if !extended {
-                                let target = bridge.submit_seq.load(Ordering::Acquire);
+                            let target = bridge.submit_seq.load(Ordering::Acquire);
+                            if extended {
+                                // Already playing the previous block. A finish
+                                // inside this budget catches up and may clear
+                                // miss/extended pipelining after two hits.
                                 if bridge.wait_done(target, budget) {
                                     self.pull_output(bridge, frames);
+                                    self.note_pipeline_success();
                                 }
+                            } else if bridge.wait_done(target, budget) {
+                                self.pull_output(bridge, frames);
+                            } else {
+                                self.note_live_miss(frames_u32);
                             }
                         }
                         }
