@@ -94,7 +94,7 @@ pub struct CollectedBlock {
 ///
 /// Control commands (`CMD_INIT`, `CMD_SHUTDOWN`) use `host_seq` / `worker_seq`.
 /// Audio uses `submit_seq` / `done_seq` and [`slots`](Self::slots). The host
-/// publishes a block and later collects the previous one. It does not wait.
+/// publishes a block and waits until that same block is finished.
 #[repr(C, align(8))]
 pub struct ZfxSharedBridge {
     pub magic: u32,
@@ -227,6 +227,34 @@ impl ZfxSharedBridge {
         None
     }
 
+    /// Wait until the worker has finished every block up through `target`.
+    ///
+    /// Returns `false` if that has not happened within 2 ms, so a stuck DLL
+    /// cannot hold the audio callback. The caller may run on the audio thread.
+    pub fn wait_done(&self, target: u32) -> bool {
+        for _ in 0..32 {
+            if seq_reached(self.done_seq.load(Ordering::Acquire), target) {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        let start = std::time::Instant::now();
+        let budget = std::time::Duration::from_micros(2_000);
+        loop {
+            let done = self.done_seq.load(Ordering::Acquire);
+            if seq_reached(done, target) {
+                return true;
+            }
+            let elapsed = start.elapsed();
+            let Some(left) = budget.checked_sub(elapsed) else {
+                return false;
+            };
+            let remain = u64::try_from(left.as_micros()).unwrap_or(1);
+            // SAFETY: `done_seq` is an aligned atomic in this bridge allocation.
+            unsafe { futex_wait(&raw const self.done_seq, done, Some(remain.max(1))) }
+        }
+    }
+
     /// Drop finished blocks without copying them. Used while bypassed.
     pub fn skip_finished(&self, collected: &mut u32) {
         let done = self.done_seq.load(Ordering::Acquire);
@@ -257,7 +285,14 @@ impl Drop for ClaimedBlock<'_> {
         self.bridge
             .done_seq
             .store(self.seq.wrapping_add(1), Ordering::Release);
+        // SAFETY: `done_seq` is the bridge word the host waits on.
+        unsafe { futex_wake(&raw const self.bridge.done_seq) }
     }
+}
+
+/// `done` has reached `target` on a wrapping counter.
+fn seq_reached(done: u32, target: u32) -> bool {
+    done.wrapping_sub(target) < (1_u32 << 31)
 }
 
 const SLOT_LIMIT: u32 = 2;

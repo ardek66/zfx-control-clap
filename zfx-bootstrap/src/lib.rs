@@ -84,8 +84,6 @@ pub struct ZfxShared {
     pub param_values: std::sync::Arc<params::ParamStore>,
     pub gui_events: std::sync::Arc<std::sync::Mutex<Vec<GuiParamEvent>>>,
     pub is_active: std::sync::atomic::AtomicBool,
-    /// One host block. The worker returns audio on the following callback.
-    pub block_latency: std::sync::atomic::AtomicU32,
     #[cfg(feature = "feat_oversampling")]
     pub oversampling_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     #[cfg(feature = "feat_oversampling")]
@@ -118,14 +116,18 @@ impl ZfxShared {
     }
 
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn latency_samples(&self) -> u32 {
         #[cfg(feature = "feat_oversampling")]
-        let filter = self
-            .oversampling_mode()
-            .latency_samples(self.oversampling_phase());
+        {
+            self.oversampling_mode()
+                .latency_samples(self.oversampling_phase())
+        }
         #[cfg(not(feature = "feat_oversampling"))]
-        let filter: u32 = 0;
-        filter.saturating_add(self.block_latency.load(Ordering::Acquire))
+        {
+            let _ = self;
+            0
+        }
     }
 }
 
@@ -963,7 +965,23 @@ impl ZfxAudioProcessor<'_> {
         })
     }
 
-    /// Copy the previous finished block into `out_l` / `out_r`. Missing audio stays silent.
+    /// Drop a block left behind by a timed-out render so this callback can
+    /// publish the samples the host just delivered.
+    fn ready_for_new_block(&mut self, bridge: &protocol::ZfxSharedBridge) -> bool {
+        bridge.skip_finished(&mut self.collected);
+        let submit = bridge.submit_seq.load(Ordering::Acquire);
+        if bridge.done_seq.load(Ordering::Acquire) == submit {
+            return true;
+        }
+        if bridge.wait_done(submit) {
+            bridge.skip_finished(&mut self.collected);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Copy the finished block into `out_l` / `out_r`. Missing audio stays silent.
     fn pull_output(&mut self, bridge: &protocol::ZfxSharedBridge, host_frames: usize) {
         let count = host_frames.min(self.out_l.len()).min(self.out_r.len());
         self.out_l[..count].fill(0.0);
@@ -1122,9 +1140,6 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         }
 
         shared.is_active.store(true, Ordering::Release);
-        shared
-            .block_latency
-            .store(config.max_frames_count, Ordering::Release);
         let collected = if bridge_ptr.is_null() {
             0
         } else {
@@ -1320,12 +1335,8 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
 
                 if frames > 0 {
                     let bridge_ptr = self.shared.bridge_ptr;
-                    if !bridge_ptr.is_null() {
-                        // SAFETY: non-null mapped bridge. The pointer is copied so
-                        // the following `&mut self` calls do not alias it.
-                        let bridge = unsafe { &*bridge_ptr };
-                        self.pull_output(bridge, frames);
-                    }
+                    self.out_l[..frames].fill(0.0);
+                    self.out_r[..frames].fill(0.0);
 
                     #[cfg(feature = "feat_oversampling")]
                     let (dsp_frames, use_oversampling) = {
@@ -1363,8 +1374,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                     #[cfg(not(feature = "feat_oversampling"))]
                     let os_factor = 1u8;
                     if !bridge_ptr.is_null() {
-                        // SAFETY: same mapped bridge as above.
+                        // SAFETY: non-null mapped bridge. The pointer is copied so
+                        // the following `&mut self` calls do not alias it.
                         let bridge = unsafe { &*bridge_ptr };
+                        if self.ready_for_new_block(bridge) {
                         let collected = self.collected;
                         let host_frames = u32::try_from(frames).unwrap_or(0);
                         #[allow(clippy::cast_possible_truncation)]
@@ -1405,6 +1418,11 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                         };
                         if published {
                             self.commit_params(&batch);
+                            let target = bridge.submit_seq.load(Ordering::Acquire);
+                            if bridge.wait_done(target) {
+                                self.pull_output(bridge, frames);
+                            }
+                        }
                         }
                     }
                 }
@@ -2005,7 +2023,6 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             params,
             gui_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             is_active: std::sync::atomic::AtomicBool::new(false),
-            block_latency: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "feat_oversampling")]
             oversampling_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 resampler::OversamplingMode::Off.to_u8(),
