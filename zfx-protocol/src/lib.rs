@@ -229,9 +229,9 @@ impl ZfxSharedBridge {
 
     /// Wait until the worker has finished every block up through `target`.
     ///
-    /// Returns `false` if that has not happened within 2 ms, so a stuck DLL
-    /// cannot hold the audio callback. The caller may run on the audio thread.
-    pub fn wait_done(&self, target: u32) -> bool {
+    /// Returns `false` if that has not happened within `timeout_us`, so a stuck
+    /// DLL cannot hold the audio callback. The caller may run on the audio thread.
+    pub fn wait_done(&self, target: u32, timeout_us: u64) -> bool {
         for _ in 0..32 {
             if seq_reached(self.done_seq.load(Ordering::Acquire), target) {
                 return true;
@@ -239,7 +239,7 @@ impl ZfxSharedBridge {
             core::hint::spin_loop();
         }
         let start = std::time::Instant::now();
-        let budget = std::time::Duration::from_micros(2_000);
+        let budget = std::time::Duration::from_micros(timeout_us);
         loop {
             let done = self.done_seq.load(Ordering::Acquire);
             if seq_reached(done, target) {
