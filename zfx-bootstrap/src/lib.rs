@@ -826,6 +826,26 @@ impl Default for BlockTransport {
     }
 }
 
+/// Smallest practical USB device block used as the fill-curve floor.
+const WAIT_FILL_F0_FRAMES: f64 = 64.0;
+/// Fill at [`WAIT_FILL_F0_FRAMES`]: enough for one IPC turn on that quantum.
+const WAIT_FILL_EPS: f64 = 0.30;
+/// Asymptote of fill as block size → ∞ (never a hard cap; spill recovers misses).
+const WAIT_FILL_L: f64 = 0.50;
+/// Block size where fill sits halfway between [`WAIT_FILL_EPS`] and [`WAIT_FILL_L`].
+const WAIT_FILL_N_HALF: f64 = 256.0;
+
+/// Fraction of block wall-time allowed for one same-callback futex wait.
+///
+/// `fill(F0) = eps`, `fill → L` as `frames → ∞`, halfway at `N_half`:
+/// `fill = L - (L - eps) / (1 + log2(max(frames, F0) / F0) / log2(N_half / F0))`.
+fn wait_fill(frames: f64) -> f64 {
+    let frames = frames.max(1.0);
+    let u = (frames.max(WAIT_FILL_F0_FRAMES) / WAIT_FILL_F0_FRAMES).log2();
+    let u_half = (WAIT_FILL_N_HALF / WAIT_FILL_F0_FRAMES).log2();
+    WAIT_FILL_L - (WAIT_FILL_L - WAIT_FILL_EPS) / (1.0 + u / u_half)
+}
+
 struct OutgoingBlock<'a> {
     kind: u8,
     host_frames: u32,
@@ -1010,22 +1030,35 @@ impl ZfxAudioProcessor<'_> {
         }
     }
 
-    /// Whole microseconds in one device block: `frames * 1e6 / sample_rate`,
-    /// truncated. Uses the settled live size when known so a larger host chunk
-    /// does not lengthen the wait.
+    /// Same-callback futex budget for one publish→done wait.
+    ///
+    /// Wall time of the settled device block (`live_block`, else `frames`) is
+    /// scaled by a fill that starts at [`WAIT_FILL_EPS`] on the USB floor
+    /// [`WAIT_FILL_F0_FRAMES`] and approaches [`WAIT_FILL_L`] as size → ∞
+    /// (half the remaining gap closed at [`WAIT_FILL_N_HALF`] frames). Larger
+    /// host chunks do not raise the budget; miss recovery stays on the
+    /// one-block spill path.
     fn block_budget_us(&self, frames: u32) -> u64 {
-        #[allow(clippy::cast_possible_truncation)]
         let rate_hz = if self.host_sample_rate.is_finite() && self.host_sample_rate > 1.0 {
-            self.host_sample_rate.round().max(1.0) as u64
+            self.host_sample_rate.round().max(1.0)
         } else {
-            48_000
+            48_000.0
         };
         let sized = if self.live_block > 0 {
-            u64::from(self.live_block.min(frames.max(1)))
+            f64::from(self.live_block.min(frames.max(1)))
         } else {
-            u64::from(frames.max(1))
+            f64::from(frames.max(1))
         };
-        sized.saturating_mul(1_000_000) / rate_hz
+        let block_us = sized * 1_000_000.0 / rate_hz;
+        let budget = (block_us * wait_fill(sized)).floor();
+        if budget.is_finite() && budget > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            {
+                budget as u64
+            }
+        } else {
+            0
+        }
     }
 
     fn set_block_latency(&self, samples: u32) {
