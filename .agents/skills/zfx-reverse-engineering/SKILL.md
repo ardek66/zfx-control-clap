@@ -321,7 +321,34 @@ Zoom ZRC archives store packed assets with a null-terminated TOC. A common pitfa
 
 ---
 
-## 9. References & Technical Deep Dives
+## 9. REA analysis recipe (Ghidra → zerocopy)
+
+Prefer this over Capstone/`objdump`-only field guessing when recovering or validating DSP object layouts.
+
+**Prerequisites (NixOS / flake):**
+- `GHIDRA_INSTALL_DIR` → extracted Ghidra **12.1.x** root (nix: `…/ghidra-12.1.2/lib/ghidra`)
+- `JAVA_HOME` → JDK 21+
+- Cursor MCP `rea` env should set both (see `~/.cursor/mcp.json`); CLI works with the same exports
+
+**Population triage (do this before deep decompiles):**
+1. Cheap-fingerprint **all** `resources/*.dll` → `.rea-evidence/fingerprints.jsonl`
+2. Collapse into `variation_classes.json` signatures `(family, size_bucket, critsec, sr_packing, order5_adjacency, channel, hps)`
+3. Pick **one** REA representative per signature (`diverge_targets.json`); prefer existing pilots; skip clones
+
+**Per-representative deep workflow:**
+1. `rea analyze "$DLL" --provider ghidra --snapshot .rea-evidence/$NAME.snapshot --format json`
+2. `rea decompile` `getinterface` → factory → `operator_new(size)` + ctor
+3. Ctor: CritSec byte offset (`uint* +0x34` → `0xd0`, `+0x35` → `0xd4`); confirm `base_end == 0xd0`
+4. `SetSampleRate` (`vtable[6]`): collect `this+offset` stores → `.rea-evidence/$NAME.family_evidence.json`
+5. Encode **parent/relative** blocks in `dsp_layout.rs`: `DspModuleBase`, `DspFamily`, `SampleRatePairPacked`/`Aligned`, `Order5Coeffs`; add family finders (`find_order5_then_sr_aligned`, `find_sr_packed_in`, `find_wah_mult_in`) — **not** per-leaf absolute tables
+6. `FilterAdapter` classifies family from RTTI and scans only inside `FamilyScanWindow`
+7. Size asserts + Evidence citations; §6 catalog stays a verification matrix of observed absolutes
+
+**Tool split:** Ghidra/REA for structure semantics; `objdump`/REA `inspect-with-objdump` only for patch RVAs and exact instruction bytes after the function is identified.
+
+---
+
+## 10. References & Technical Deep Dives
 
 * [C++ DSP Class Architecture & Memory Layouts](references/cpp_class_architecture.md): Complete specification of C++ classes, vtables, sub-objects, and hot-patching offsets.
 * [VST 2.4 Internal ABI Reference](references/vst_opcodes.md): Dispatcher and host callback opcodes and timing structs.

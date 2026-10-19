@@ -23,8 +23,29 @@
             "i686-pc-windows-gnu"
           ];
         };
+        # Pinned to match REA's supported Node engines (^22.19 || ^24.11 || >=26).
+        nodejs = pkgs.nodejs_24;
+        # REA's Cursor MCP entry. Keep the package pin in sync with setup/doctor.
+        reaAgentsVersion = "6.7.0";
+        rea-mcp = pkgs.writeShellApplication {
+          name = "rea-mcp";
+          runtimeInputs = [ nodejs ];
+          text = ''
+            exec npx --yes "rea-agents@${reaAgentsVersion}" mcp "$@"
+          '';
+        };
       in
       {
+        packages = {
+          inherit nodejs rea-mcp;
+          default = rea-mcp;
+        };
+
+        apps.rea-mcp = {
+          type = "app";
+          program = "${rea-mcp}/bin/rea-mcp";
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             unzip
@@ -46,6 +67,8 @@
             libxi
             libglvnd
             libxkbcommon
+            nodejs
+            rea-mcp
           ];
 
           shellHook = ''
@@ -58,7 +81,7 @@
               pkgs.libxkbcommon
             ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             echo "Zoom C5.1t Reverse Engineering Environment Loaded!"
-            echo "Available tools: ghidra, radare2, strings, unzip, 7z, innoextract, cabextract, wine, python3, clippy"
+            echo "Available tools: ghidra, radare2, strings, unzip, 7z, innoextract, cabextract, wine, python3, clippy, node, rea-mcp"
           '';
         };
 

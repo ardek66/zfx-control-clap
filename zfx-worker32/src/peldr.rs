@@ -1,16 +1,17 @@
 use goblin::pe::PE;
+use std::cell::Cell;
 use std::ffi::{c_void, CStr};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::analog_proto;
 use crate::dsp_layout::{
-    BiquadCoeffs, MemoryView, Order5Coeffs, Order5SubObject, WahResonatorParams,
+    BiquadCoeffs, CritSecKind, CRITSEC_SIZE, DEFAULT_OBJECT_PROBE_LEN, DSP_MODULE_BASE_END,
+    DspFamily, FamilyScanWindow, MemoryView, Order5Coeffs, Order5SubObject, SrDiscoveryPolicy,
+    WahResonatorParams, HPS_HELPER_OBJECT_OFFSET,
 };
 use zerocopy::{little_endian as le, FromBytes, Immutable, IntoBytes, KnownLayout};
-
-use std::sync::atomic::AtomicUsize;
 
 const MAX_TRACKED_ALLOCS: usize = 1024;
 static TRACKED_ALLOCS: [AtomicUsize; MAX_TRACKED_ALLOCS] =
@@ -713,6 +714,7 @@ impl PeModule {
         crate::worker_log!("[peldr] Calling getinterface({host_cb_ptr:?})...");
         // SAFETY: Invoking getinterface with default_audio_master host callback under Win32ContextGuard.
         let instance = unsafe {
+            let _construct_guard = DspObjectConstructionGuard::enter();
             let _guard = Win32ContextGuard::enter();
             getinterface(host_cb_ptr)
         };
@@ -737,10 +739,14 @@ impl PeModule {
         let obj = unsafe { (*effect).object.cast::<*mut usize>() };
         if !obj.is_null() {
             let obj_u8 = obj.cast::<u8>();
-            // SAFETY: Checking if [obj + 0x328] is null and this is an HPS effect instance.
+            // SAFETY: Checking if [obj + HPS_HELPER_OBJECT_OFFSET] is null for HPS-class plugins.
+            // Offset confirmed via `mov edx,[ebx+0x328]` opcode scan; Pedal_Pitch (0x278) is too
+            // small — only larger Harmonized Pitch Shifter objects use this slot.
             unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
-                let p_sub = obj_u8.add(0x328).cast::<*mut HpsPitchHelper>();
+                let p_sub = obj_u8
+                    .add(HPS_HELPER_OBJECT_OFFSET)
+                    .cast::<*mut HpsPitchHelper>();
                 if (*p_sub).is_null() {
                     let pe_bytes =
                         std::slice::from_raw_parts(self.base_addr.cast::<u8>(), self.size);
@@ -748,7 +754,9 @@ impl PeModule {
                         .windows(6)
                         .any(|w| w == [0x8b, 0x93, 0x28, 0x03, 0x00, 0x00])
                     {
-                        crate::worker_log!("[peldr] Installed HpsPitchHelper at [obj + 0x328]");
+                        crate::worker_log!(
+                            "[peldr] Installed HpsPitchHelper at [obj + {HPS_HELPER_OBJECT_OFFSET:#x}]"
+                        );
                         let helper = libc::malloc(std::mem::size_of::<HpsPitchHelper>()).cast::<HpsPitchHelper>();
                         if !helper.is_null() {
                             std::ptr::write(
@@ -782,6 +790,10 @@ impl PeModule {
         clippy::cognitive_complexity
     )]
     pub fn scan_filter_adapter(&self, effect: *mut AEffect) -> FilterAdapter {
+        let known_object_size = KNOWN_DSP_OBJECT_SIZE.load(Ordering::Relaxed);
+        let probe_len = known_object_size.max(DEFAULT_OBJECT_PROBE_LEN);
+        let critsec_kind = take_pending_critsec_kind();
+
         let mut adapter = FilterAdapter {
             biquad_offsets: [0; 8],
             num_biquads: 0,
@@ -799,12 +811,29 @@ impl PeModule {
             wah_offset: None,
             wah_base_multiplier: 0.0,
             comb_gain_base: None,
+            dsp_family: DspFamily::Unknown,
+            critsec_kind,
+            object_probe_len: probe_len,
+            scan_window: FamilyScanWindow::from_object(critsec_kind, probe_len),
         };
 
         // SAFETY: Slicing the mapped PE image memory to locate sample rate branching opcodes.
         let mem = unsafe { std::slice::from_raw_parts(self.base_addr.cast::<u8>(), self.size) };
         let base = self.base_addr as usize;
         let end = base.saturating_add(self.size);
+
+        // Classify family from RTTI; constrained scans run later inside the family window.
+        adapter.dsp_family = DspFamily::from_pe_rtti(mem);
+        adapter.scan_window =
+            FamilyScanWindow::from_object(adapter.critsec_kind, adapter.object_probe_len);
+        crate::worker_log!(
+            "[peldr] DspFamily::{:?} critsec={:?} probe_len={:#x} (scan window {:#x}..{:#x}, base_end={DSP_MODULE_BASE_END:#x})",
+            adapter.dsp_family,
+            adapter.critsec_kind,
+            adapter.object_probe_len,
+            adapter.scan_window.start,
+            adapter.scan_window.end
+        );
 
         // 1. Check for WahMultiplier pattern: cmp esi, 0xbb80 (\x81\xfe\x80\xbb\x00\x00)
         let wah_sig = [0x81u8, 0xfe, 0x80, 0xbb, 0x00, 0x00];
@@ -945,13 +974,14 @@ impl PeModule {
                             clobber_abi("C"),
                         );
                     }
-                    let mut snap_44k = [0u8; 0x300];
-                    // SAFETY: Reading 0x300 bytes of DSP object memory for 44.1k snapshot.
+                    let probe_len = adapter.object_probe_len;
+                    let mut snap_44k = vec![0u8; probe_len];
+                    // SAFETY: Reading `probe_len` bytes of DSP object memory for 44.1k snapshot.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             obj.cast::<u8>(),
                             snap_44k.as_mut_ptr(),
-                            0x300,
+                            probe_len,
                         );
                     }
 
@@ -969,13 +999,13 @@ impl PeModule {
                             clobber_abi("C"),
                         );
                     }
-                    let mut snap_48k = [0u8; 0x300];
-                    // SAFETY: Reading 0x300 bytes of DSP object memory for 48k snapshot.
+                    let mut snap_48k = vec![0u8; probe_len];
+                    // SAFETY: Reading `probe_len` bytes of DSP object memory for 48k snapshot.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             obj.cast::<u8>(),
                             snap_48k.as_mut_ptr(),
-                            0x300,
+                            probe_len,
                         );
                     }
 
@@ -993,13 +1023,13 @@ impl PeModule {
                             clobber_abi("C"),
                         );
                     }
-                    let mut snap_96k = [0u8; 0x300];
-                    // SAFETY: Reading 0x300 bytes of DSP object memory for 96k snapshot.
+                    let mut snap_96k = vec![0u8; probe_len];
+                    // SAFETY: Reading `probe_len` bytes of DSP object memory for 96k snapshot.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             obj.cast::<u8>(),
                             snap_96k.as_mut_ptr(),
-                            0x300,
+                            probe_len,
                         );
                     }
 
@@ -1019,20 +1049,74 @@ impl PeModule {
                         );
                     }
 
+                    if adapter.critsec_kind == CritSecKind::Unknown {
+                        adapter.critsec_kind = critsec_kind_from_snap_fallback(&snap_48k);
+                        adapter.scan_window = FamilyScanWindow::from_object(
+                            adapter.critsec_kind,
+                            adapter.object_probe_len,
+                        );
+                        crate::worker_log!(
+                            "[peldr] CritSec fallback from snap_48k: {:?}",
+                            adapter.critsec_kind
+                        );
+                    }
+
                     let view_44 = MemoryView::new(&snap_44k);
                     let view_48 = MemoryView::new(&snap_48k);
                     let view_96 = MemoryView::new(&snap_96k);
+                    let window = adapter.scan_window.as_range();
+                    let family = adapter.dsp_family;
 
-                    // Discover sample rate f64 offset
-                    if let Some(off) = view_48.find_sr_f64(&view_44) {
-                        crate::worker_log!("[peldr] Discovered sr_f64_offset at {off:#x}");
-                        adapter.sr_f64_offset = Some(off);
+                    // Evidence-backed SR discovery via SrDiscoveryPolicy (inverted Amp hint first).
+                    let policy = if DspFamily::prefers_inverted_sr_from_rtti(mem) {
+                        SrDiscoveryPolicy::InvertedPair
+                    } else {
+                        family.sr_discovery_policy()
+                    };
+                    let hit = view_48.discover_sr(
+                        policy,
+                        window.clone(),
+                        &view_44,
+                        &view_96,
+                        family.also_try_packed_after_order5(),
+                    );
+                    // If inverted hint missed, fall back to the family's normal policy.
+                    let hit = if !hit.found_sr()
+                        && matches!(policy, SrDiscoveryPolicy::InvertedPair)
+                    {
+                        view_48.discover_sr(
+                            family.sr_discovery_policy(),
+                            window.clone(),
+                            &view_44,
+                            &view_96,
+                            family.also_try_packed_after_order5(),
+                        )
+                    } else {
+                        hit
+                    };
+
+                    if let Some(o5) = hit.order5_offset {
+                        crate::worker_log!(
+                            "[peldr] Order5→SR via {policy:?}: order5={o5:#x} sr_i32={:?}",
+                            hit.sr_i32_offset
+                        );
+                        adapter.order5_offset = Some(o5);
+                        if let Some(coeffs) = view_48.read_struct::<Order5Coeffs>(o5) {
+                            adapter.order5_base_a = coeffs.a;
+                            adapter.order5_base_b = coeffs.b;
+                        }
                     }
-
-                    // Discover sample rate i32 offset
-                    if let Some(off) = view_48.find_sr_i32(&view_44) {
-                        crate::worker_log!("[peldr] Discovered sr_i32_offset at {off:#x}");
+                    if let Some(off) = hit.sr_i32_offset {
+                        crate::worker_log!(
+                            "[peldr] SR i32 at {off:#x} (policy={policy:?}, family={family:?})"
+                        );
                         adapter.sr_i32_offset = Some(off);
+                    }
+                    if let Some(off) = hit.sr_f64_offset {
+                        crate::worker_log!(
+                            "[peldr] SR f64 at {off:#x} (policy={policy:?}, family={family:?})"
+                        );
+                        adapter.sr_f64_offset = Some(off);
                     }
 
                     // Discover comb delay length offset and buffer pointer offset
@@ -1052,24 +1136,49 @@ impl PeModule {
                         adapter.comb_gain_base = comb.feedback_gain;
                     }
 
-                    // Discover 5th-order cabinet / tone filter
-                    if let Some((off, coeffs)) = view_48.find_order5(&view_44, &view_96) {
-                        crate::worker_log!(
-                            "[peldr] Discovered 5th-order filter at offset {off:#x} (A1={}, A5={}, B0={})",
-                            coeffs.a[0], coeffs.a[4], coeffs.b[0]
-                        );
-                        adapter.order5_offset = Some(off);
-                        adapter.order5_base_a = coeffs.a;
-                        adapter.order5_base_b = coeffs.b;
+                    // Discover 5th-order cabinet / tone filter inside the family window.
+                    if adapter.order5_offset.is_none() {
+                        if let Some((off, coeffs)) =
+                            view_48.find_order5_in(window.clone(), &view_44, &view_96)
+                        {
+                            crate::worker_log!(
+                                "[peldr] Discovered 5th-order filter at offset {off:#x} (A1={}, A5={}, B0={})",
+                                coeffs.a[0], coeffs.a[4], coeffs.b[0]
+                            );
+                            adapter.order5_offset = Some(off);
+                            adapter.order5_base_a = coeffs.a;
+                            adapter.order5_base_b = coeffs.b;
+                        }
+                    } else if let Some(off) = adapter.order5_offset {
+                        if let Some(coeffs) = view_48.read_struct::<Order5Coeffs>(off) {
+                            adapter.order5_base_a = coeffs.a;
+                            adapter.order5_base_b = coeffs.b;
+                        }
                     }
 
-                    // Discover wah multiplier offset
-                    if let Some((off, v48)) = view_48.find_wah_multiplier(&view_44) {
-                        crate::worker_log!(
-                            "[peldr] Discovered wah multiplier at offset {off:#x} (base_48k={v48})"
-                        );
-                        adapter.wah_offset = Some(off);
-                        adapter.wah_base_multiplier = v48;
+                    // Wah multiplier inside family window (tail scalars move per leaf).
+                    if matches!(family, DspFamily::Wah) && adapter.wah_offset.is_none() {
+                        if let Some((off, v48)) =
+                            view_48.find_wah_mult_in(window.clone(), &view_44)
+                        {
+                            crate::worker_log!(
+                                "[peldr] Discovered wah multiplier at offset {off:#x} (base_48k={v48})"
+                            );
+                            adapter.wah_offset = Some(off);
+                            adapter.wah_base_multiplier = v48;
+                        }
+                    } else if adapter.wah_offset.is_none() {
+                        if let Some((off, v48)) = view_48.find_wah_multiplier(&view_44) {
+                            crate::worker_log!(
+                                "[peldr] Discovered wah multiplier at offset {off:#x} (base_48k={v48})"
+                            );
+                            adapter.wah_offset = Some(off);
+                            adapter.wah_base_multiplier = v48;
+                        }
+                    } else if let Some(off) = adapter.wah_offset {
+                        if let Some(v48) = view_48.read_f64(off) {
+                            adapter.wah_base_multiplier = v48;
+                        }
                     }
                 }
             }
@@ -1100,6 +1209,14 @@ pub struct FilterAdapter {
     pub wah_offset: Option<usize>,
     pub wah_base_multiplier: f64,
     pub comb_gain_base: Option<f64>,
+    /// Family classified from PE RTTI / catalog (drives constrained scan rules).
+    pub dsp_family: DspFamily,
+    /// CritSec placement variant observed during DSP ctor (`InitializeCriticalSection`).
+    pub critsec_kind: CritSecKind,
+    /// Bytes copied from the live DSP object for layout snapshots.
+    pub object_probe_len: usize,
+    /// Byte window for family-relative SR / Order5 / wah discovery.
+    pub scan_window: FamilyScanWindow,
 }
 
 // SAFETY: FilterAdapter pointers refer to mapped PE section memory that remains valid for the module lifetime.
@@ -1462,9 +1579,13 @@ impl ZfxDspInstance {
                 }
             }
             if let Some(off_i32) = self.filter_adapter.sr_i32_offset {
-                // If this is HPS with a buffer at 0x148 sized to [obj + 0xec] * 8, resize buffer
-                if off_i32 == 0xec {
-                    // SAFETY: Checking buffer pointer at 0x148
+                // HPS-only: buffer at 0x148 is sized to sr_i32@0xec * 8.
+                // Many PackedSr plugins also use 0xec/0xf0 (Analog_Delay, Auto_Wah, …) —
+                // reallocating 0x148 there corrupts delay state and can hang/crash the DAW.
+                if off_i32 == 0xec
+                    && matches!(self.filter_adapter.dsp_family, DspFamily::Pitch)
+                {
+                    // SAFETY: Checking buffer pointer at 0x148 on Pitch/HPS objects only.
                     unsafe {
                         let p_buf = obj_u8.add(0x148).cast::<*mut f64>();
                         let old_buf = std::ptr::read_unaligned(p_buf);
@@ -1757,6 +1878,89 @@ impl Drop for PeModule {
 
 pub static CURRENT_SAMPLE_RATE: AtomicI32 = AtomicI32::new(44100);
 pub static CURRENT_BLOCK_SIZE: AtomicI32 = AtomicI32::new(256);
+
+/// Largest `operator_new` / malloc size seen while constructing the DSP via getinterface.
+static KNOWN_DSP_OBJECT_SIZE: AtomicUsize = AtomicUsize::new(0);
+static DSP_OBJECT_UNDER_CONSTRUCTION: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// `(object_base, object_size)` while the Zoom DSP ctor runs inside getinterface.
+    static CURRENT_DSP_OBJECT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static PENDING_CRITSEC_KIND: Cell<CritSecKind> = const { Cell::new(CritSecKind::Unknown) };
+}
+
+/// Active during getinterface so malloc / CritSec hooks can attribute layout to the DSP object.
+struct DspObjectConstructionGuard;
+
+impl DspObjectConstructionGuard {
+    fn enter() -> Self {
+        DSP_OBJECT_UNDER_CONSTRUCTION.store(true, Ordering::Relaxed);
+        KNOWN_DSP_OBJECT_SIZE.store(0, Ordering::Relaxed);
+        CURRENT_DSP_OBJECT.with(|c| c.set((0, 0)));
+        PENDING_CRITSEC_KIND.with(|c| c.set(CritSecKind::Unknown));
+        Self
+    }
+}
+
+impl Drop for DspObjectConstructionGuard {
+    fn drop(&mut self) {
+        DSP_OBJECT_UNDER_CONSTRUCTION.store(false, Ordering::Relaxed);
+        CURRENT_DSP_OBJECT.with(|c| c.set((0, 0)));
+    }
+}
+
+#[must_use]
+fn critsec_kind_from_offset(off: usize) -> CritSecKind {
+    match off {
+        0xd0 => CritSecKind::At0D0,
+        0xd4 => CritSecKind::At0D4,
+        0xe8 => CritSecKind::At0E8,
+        0x100 => CritSecKind::At0100,
+        _ => CritSecKind::Unknown,
+    }
+}
+
+fn take_pending_critsec_kind() -> CritSecKind {
+    PENDING_CRITSEC_KIND.with(Cell::get)
+}
+
+fn record_critsec_kind_from_hook(cs: *mut c_void) {
+    if cs.is_null() {
+        return;
+    }
+    let cs_addr = cs.cast::<u8>() as usize;
+    CURRENT_DSP_OBJECT.with(|cell| {
+        let (base, size) = cell.get();
+        if base == 0 || size == 0 {
+            return;
+        }
+        let end = base.saturating_add(size);
+        if cs_addr < base || cs_addr.saturating_add(CRITSEC_SIZE) > end {
+            return;
+        }
+        let off = cs_addr - base;
+        let kind = critsec_kind_from_offset(off);
+        if kind != CritSecKind::Unknown {
+            PENDING_CRITSEC_KIND.with(|pending| pending.set(kind));
+        }
+    });
+}
+
+fn snap_region_looks_like_initialized_critsec(region: &[u8]) -> bool {
+    region.len() >= CRITSEC_SIZE && region[..CRITSEC_SIZE].iter().all(|&b| b == 0)
+}
+
+fn critsec_kind_from_snap_fallback(snap: &[u8]) -> CritSecKind {
+    for off in [0xd0_usize, 0xd4, 0xe8, 0x100] {
+        if off + CRITSEC_SIZE <= snap.len() {
+            let region = &snap[off..off + CRITSEC_SIZE];
+            if snap_region_looks_like_initialized_critsec(region) {
+                return critsec_kind_from_offset(off);
+            }
+        }
+    }
+    CritSecKind::Unknown
+}
 
 // VST 2.4 VstTimeInfo structure for host callbacks (audioMasterGetTime)
 #[repr(C)]
@@ -2191,7 +2395,8 @@ pub unsafe extern "stdcall" fn hook_SetupDiDestroyDeviceInfoList(
 // --- KERNEL32 Trampolines ---
 
 #[no_mangle]
-pub const unsafe extern "stdcall" fn hook_InitializeCriticalSection(cs: *mut c_void) {
+pub unsafe extern "stdcall" fn hook_InitializeCriticalSection(cs: *mut c_void) {
+    record_critsec_kind_from_hook(cs);
     if !cs.is_null() {
         // SAFETY: Initializing 24-byte Win32 CRITICAL_SECTION structure.
         unsafe {
@@ -2347,6 +2552,15 @@ pub unsafe extern "C" fn hook_malloc(size: usize) -> *mut c_void {
             {
                 break;
             }
+        }
+        if DSP_OBJECT_UNDER_CONSTRUCTION.load(Ordering::Relaxed) && size >= DSP_MODULE_BASE_END {
+            KNOWN_DSP_OBJECT_SIZE.fetch_max(size, Ordering::Relaxed);
+            CURRENT_DSP_OBJECT.with(|cell| {
+                let (_, prev_size) = cell.get();
+                if size >= prev_size {
+                    cell.set((u, size));
+                }
+            });
         }
     }
     p

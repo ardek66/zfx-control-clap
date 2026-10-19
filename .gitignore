@@ -24,3 +24,6 @@ decompiled.c
 fcn000136b0.txt
 host_dll_imports.txt
 *.bundle
+/.rea-evidence/
+/result
+/.cursor/

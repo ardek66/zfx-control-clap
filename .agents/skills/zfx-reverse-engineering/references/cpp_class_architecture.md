@@ -163,43 +163,40 @@ struct CombFilter {
 
 ## 4. Reconstructed C++ Class Definitions
 
-### 4.1 Base Distortion Stompbox (`CZfxDistortionModule`)
-Representative plugins: `FUZZ_SMILE`, `GREAT_MUFF`, `TubeScreamen`, `SQUEAK`, `THE_governor`, `Metal_World`.
+Parent-first model (Evidence: `.rea-evidence/base_extent.json`, `variation_classes.json`).
+Rust mirrors this as `DspModuleBase` + extensible `DspFamily` relative-block scanners in
+[`zfx-worker32/src/dsp_layout.rs`](../../../../zfx-worker32/src/dsp_layout.rs) — **not** one
+`KnownPluginLayout` absolute table per leaf RTTI name.
+
+### 4.0 Shared base (`CZfxDspModule` / `DspModuleBase`)
+
+Measured across Wah / Amp / Pitch / Distortion / EQ ctors:
+
+| Region | Offset | Notes |
+| :--- | :---: | :--- |
+| `vtable` | `0x00` | MSVC `__thiscall` |
+| Early zeros / flags | `0xc0`, `0xc8` | Common ctor stores before CritSec |
+| **`base_end`** | **`0xd0`** | Family / CritSec divergence point |
+| CritSec variant A | `0xd0` | `InitializeCriticalSection(this+0x34)` as `uint*` → byte `0xd0` |
+| CritSec variant B | `0xd4` | `…(this+0x35)` → byte `0xd4` (e.g. `100BassMan`) |
+| CritSec size | `0x18` | `RTL_CRITICAL_SECTION` |
+
+Family scan window starts after CritSec (`0xe8` or `0xec`), or conservatively at `base_end`.
+VST `AEffect` / `Z_TypeIF` stay outside this tree (`peldr.rs`).
+
+### 4.1 Distortion family (`CZfxDistortionModule`)
+Representative plugins: `FUZZ_SMILE`, `GREAT_MUFF`, `TubeScreamen`, `Over_Driven`, `Booster`, …
+
+**Relative block (preferred):** when present, embedded `Order5Coeffs` immediately followed by
+aligned `SampleRatePairAligned` (`order5_off + 88 == sr_i32`), same adjacency rule as AmpOrder5.
+Some stomps keep an early packed SR pair instead (`Booster` / `GREAT_MUFF` catalog rows).
 
 ```cpp
 class CZfxDistortionModule : public CZfxDspModule {
 public:
-    // [this + 0x00]
-    void* vtable;
-
-    // [this + 0x04]
-    int32_t m_bBypass;
-
-    // [this + 0x08]
-    float m_fGain;
-
-    // [this + 0x0C]
-    float m_fTone;
-
-    // [this + 0x10]
-    float m_fLevel;
-
-    // [this + sr_i32_offset] (44100 / 48000)
-    int32_t m_nSampleRate;
-
-    // [this + sr_f64_offset] (44100.0 / 48000.0)
-    double m_fSampleRate;
-
-    // Tone shaping & speaker simulator stage
-    // [this + order5_offset]
-    Order5FilterCoeffs m_CabinetFilter;
-
-    // Direct Form filter delay history
-    // [this + order5_offset + 0x58]
-    double m_HistoryX[5];
-
-    // [this + order5_offset + 0x80]
-    double m_HistoryY[5];
+    // [0x00 .. base_end)  DspModuleBase
+    // CritSec @ 0xd0 or 0xd4
+    // Family window: Order5Coeffs then SampleRatePairAligned  —OR— packed SR pair
 };
 ```
 
@@ -207,6 +204,10 @@ public:
 
 ### 4.2 Multi-Channel High-Gain Amplifier (`CZfxMultiChannelAmp`)
 Representative plugins: `DZ_Bert` (Diezel Herbert), `PV_STACK` (Peavey 5150).
+
+Still a child of `DspModuleBase`; channel pointer slots are **leaf topology** on top of the
+AmpOrder5 / “other packing” relative rules. Prefer family-window discovery over hard-coded
+`0x1a8`-style absolute seeds when porting.
 
 These flagship amplifiers allocate three distinct channel objects on the heap representing Clean, Crunch, and Lead preamps.
 
@@ -329,36 +330,34 @@ public:
 
 ---
 
-### 4.4 State-Variable Wah & Resonator (`CZfxWahModule`)
-Representative plugins: `Auto_Wah`, `PEDAL_CRY`.
+### 4.4 Wah family (`CZfxWahModule` / `DspFamily::Wah`)
+Representative plugins: `Auto_Wah`, `PEDAL_CRY`, `Cry`, `PEDAL_BOX`.
+
+**Relative block (Evidence):** CritSec `@0xd0`, then packed `SampleRatePairPacked` at the **shared**
+slot `sr_i32@0xec` / `sr_f64@0xf0`. Wah-tail scalars move per leaf (`0x1a8` vs `0x1e0`) — locate with
+`MemoryView::find_wah_mult_in` inside the family window, not absolute leaf tables.
 
 ```cpp
 class CZfxWahModule : public CZfxDspModule {
 public:
-    // [this + 0x00]
-    void* vtable;
-
-    // Sub-objects
-    // [this + 0x134] (Auto_Wah) / [0x114] (PEDAL_CRY)
-    void* m_pEnvelopeDetector;
-
-    // [this + 0x13c]
-    void* m_pStateVariableCore;
-
-    // Frequency modulation parameters
-    // [this + 0x1a8] (Auto_Wah: 0.005)
-    double m_fMinCutoffNorm;
-
-    // [this + 0x1b0] (Auto_Wah: 0.03)
-    double m_fSweepRangeNorm;
-
-    // [this + 0x1c8] (Auto_Wah: 0.1378) / [0x1e0] (PEDAL_CRY: 0.14)
-    double m_fBaseFrequencyMult;
-
-    // [this + 0x1e8] (0.5)
-    double m_fResonanceQ;
+    // [0x00 .. 0xd0) DspModuleBase
+    // CritSec @ 0xd0
+    // SampleRatePairPacked @ 0xec   // shared across Auto_Wah / PEDAL_CRY
+    // wah-tail doubles after family block (leaf deltas)
 };
 ```
+
+### 4.5 AmpOrder5 family (`DspFamily::AmpOrder5`)
+Representative plugins: `100BassMan`, `Tangerine` / `Orange`, `ClassicAmp`, …
+
+**Relative block:** `[Order5Coeffs][SampleRatePairAligned]` by adjacency (`+88`). Absolute starts
+differ (`0x1c0` vs `0x1d0`) because intermediate amp members change size — one finder covers both.
+
+CritSec may be `@0xd0` (Tangerine) or `@0xd4` (BassMan).
+
+### 4.6 Pitch family (`DspFamily::Pitch`)
+Representative: `Pedal_Pitch` (packed SR `@0x11c`/`0x120`). Larger HPS leaves add helper ptr at
+`[this+0x328]` (`HPS_HELPER_OBJECT_OFFSET`) — leaf quirk, not a base field.
 
 ---
 
@@ -387,7 +386,32 @@ When run in a modern DAW at 96 kHz:
 
 ## 6. Dynamic Memory Map & Verified Offset Catalog
 
-The table below compiles the verified field offsets discovered across the Zoom ZFX catalog:
+### 6.0 REA / Ghidra decompilation confirmation (pilots)
+
+Pilot DLLs were re-analyzed with REA (`rea-agents@6.7.0`) + Ghidra 12.1.2. Decompiled
+`SetSampleRate` (`vtable[6]`) confirms the catalog rows below and the zerocopy encodings in
+[`zfx-worker32/src/dsp_layout.rs`](../../../../zfx-worker32/src/dsp_layout.rs):
+
+| Plugin | Object size | `SetSampleRate` VA | `sr_i32` / `sr_f64` packing | Extra |
+| :--- | :---: | :---: | :--- | :--- |
+| `Pedal_Pitch` | `0x278` | `0x10001950` | Packed 12 B (`i32@0x11c` + `f64@0x120`) | `SampleRatePairPacked` |
+| `Auto_Wah` | `0x1e0` | `0x10001570` | Packed 12 B (`i32@0xec` + `f64@0xf0`) | Wah scalar `@0x1a8` |
+| `PEDAL_CRY` | `0x250` | `0x10001760` | Packed 12 B (`i32@0xec` + `f64@0xf0`) | WahMultiplier `@0x1e0` |
+| `100BassMan` | `0x250` | `0x10001840` | Aligned 16 B (`i32@0x218` + pad4 + `f64@0x220`) | `Order5Coeffs@0x1c0` packs to `sr_i32` |
+| `Tangerine` | `0x270` | `0x10001a90` | Aligned 16 B (`i32@0x228` + pad4 + `f64@0x230`) | `Order5Coeffs@0x1d0` packs to `sr_i32` |
+
+**Rule:** when `sr_i32_offset % 8 == 4`, the following `f64` is contiguous (12-byte pair).
+When `sr_i32_offset % 8 == 0`, MSVC inserts 4 bytes of padding before `sr_f64` (16-byte pair).
+
+`FilterAdapter` classifies `DspFamily` from PE RTTI, then runs **constrained** snapshot scans
+inside `FamilyScanWindow` (Order5→SR adjacency, packed SR, wah mult). Absolute pilot offsets
+below are a **verification matrix** (family + prefix), not the Rust source of truth.
+
+Local Evidence (gitignored): `.rea-evidence/base_extent.json`, `fingerprints.jsonl`,
+`variation_classes.json`, `*.family_evidence.json`, `pilot_field_map.json`.
+
+The table below compiles the verified field offsets discovered across the Zoom ZFX catalog
+(derived / observed absolutes for verification):
 
 | Plugin Name | Category | `sr_f64` Offset | `sr_i32` Offset | Filter Feature Offset | Sub-Objects | Verified Max Error |
 | :--- | :--- | :---: | :---: | :--- | :--- | :---: |

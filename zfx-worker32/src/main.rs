@@ -191,6 +191,60 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    // Live-load discovery smoke: print FilterAdapter fields as one JSON object on stdout.
+    if args.len() > 2 && args[1] == "--discover-dll" {
+        let dll_path = &args[2];
+        let dll_stem = std::path::Path::new(dll_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let dll_bytes = match std::fs::read(dll_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "{{\"dll\":{dll_stem:?},\"ok\":false,\"error\":\"read: {e}\"}}"
+                );
+                std::process::exit(1);
+            }
+        };
+        let pe = match peldr::PeModule::load(&dll_bytes) {
+            Ok(pe) => pe,
+            Err(e) => {
+                eprintln!("{{\"dll\":{dll_stem:?},\"ok\":false,\"error\":\"load: {e}\"}}");
+                std::process::exit(1);
+            }
+        };
+        let inst = match pe.init_zfx_plugin() {
+            Ok(inst) => inst,
+            Err(e) => {
+                eprintln!("{{\"dll\":{dll_stem:?},\"ok\":false,\"error\":\"init: {e}\"}}");
+                std::process::exit(1);
+            }
+        };
+        let fa = &inst.filter_adapter;
+        let opt_hex = |o: Option<usize>| -> String {
+            o.map_or_else(|| "null".to_string(), |v| format!("{v}"))
+        };
+        let crit = fa
+            .critsec_kind
+            .byte_offset()
+            .map_or_else(|| "null".to_string(), |v| format!("{v}"));
+        println!(
+            "{{\"dll\":{dll_stem:?},\"ok\":true,\"dsp_family\":\"{:?}\",\"critsec_kind\":\"{:?}\",\"crit\":{crit},\"object_probe_len\":{},\"scan_start\":{},\"scan_end\":{},\"sr_i32\":{},\"sr_f64\":{},\"order5\":{},\"comb_len\":{},\"comb_buf\":{},\"wah\":{}}}",
+            fa.dsp_family,
+            fa.critsec_kind,
+            fa.object_probe_len,
+            fa.scan_window.start,
+            fa.scan_window.end,
+            opt_hex(fa.sr_i32_offset),
+            opt_hex(fa.sr_f64_offset),
+            opt_hex(fa.order5_offset),
+            opt_hex(fa.comb_len_offset),
+            opt_hex(fa.comb_buf_offset),
+            opt_hex(fa.wah_offset),
+        );
+        std::process::exit(0);
+    }
     if args.len() > 2 && args[1] == "--test-dll" {
         let dll_path = &args[2];
         let dll_bytes = match std::fs::read(dll_path) {

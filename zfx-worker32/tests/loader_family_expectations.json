@@ -1,0 +1,149 @@
+{
+  "generated": "2026-10-20T00:00:00.000Z",
+  "source": "loader_families.json",
+  "expectations": [
+    {
+      "loader_family": "CabCompactSr",
+      "dll": "AC_Bass_370_Stack_1x18",
+      "crit": null,
+      "packing": "aligned",
+      "sr_i32": 208,
+      "sr_f64": 216,
+      "order5": null,
+      "process_family": "CabComb",
+      "notes": "compact cab stack; no critsec uint"
+    },
+    {
+      "loader_family": "Order5ThenSrAligned",
+      "dll": "100BassMan",
+      "crit": 212,
+      "packing": "aligned",
+      "sr_i32": 536,
+      "sr_f64": 544,
+      "order5": 448,
+      "process_family": "Order5Process",
+      "notes": "order5 adjacent then aligned SR stores"
+    },
+    {
+      "loader_family": "PackedSr",
+      "dll": "Auto_Wah",
+      "crit": 208,
+      "packing": "packed",
+      "sr_i32": 236,
+      "sr_f64": 240,
+      "order5": null,
+      "process_family": "WahProcess",
+      "notes": "wah smoke rep; pilot decomp-only"
+    },
+    {
+      "loader_family": "UtilityEarlySr",
+      "dll": "Mixer",
+      "crit": 212,
+      "packing": "other",
+      "sr_i32": 12,
+      "sr_f64": null,
+      "order5": null,
+      "process_family": "UtilityMix",
+      "notes": "early SR @0xc; i32-only layout"
+    },
+    {
+      "loader_family": "InvertedSr",
+      "dll": "DZ_Bert",
+      "crit": 208,
+      "packing": "inverted",
+      "sr_i32": 248,
+      "sr_f64": 240,
+      "order5": 512,
+      "process_family": "Order5Process",
+      "notes": "inverted f64/i32; order5 gap on amp"
+    },
+    {
+      "loader_family": "PackedSr",
+      "dll": "HPS",
+      "crit": 208,
+      "packing": "packed",
+      "sr_i32": 236,
+      "sr_f64": 240,
+      "order5": null,
+      "process_family": "HpsBody",
+      "notes": "HPS helper/scratch body; comb in process"
+    },
+    {
+      "loader_family": "PackedSr",
+      "dll": "Delay",
+      "crit": 232,
+      "packing": "packed",
+      "sr_i32": 260,
+      "sr_f64": 264,
+      "order5": null,
+      "process_family": "ModDelayProcess",
+      "notes": "moddelay; sibling Chorus_Vibrato pattern"
+    },
+    {
+      "loader_family": "PackedSr",
+      "dll": "Compressor",
+      "crit": 256,
+      "packing": "packed",
+      "sr_i32": 332,
+      "sr_f64": 336,
+      "order5": null,
+      "process_family": "DynamicsProcess",
+      "notes": "dynamics/EQ cluster rep; non-comb process"
+    },
+    {
+      "loader_family": "AlignedSr",
+      "dll": "1959",
+      "crit": 212,
+      "packing": "aligned",
+      "sr_i32": 608,
+      "sr_f64": 616,
+      "order5": 496,
+      "process_family": "Order5Process",
+      "notes": "aligned SR with order5 gap"
+    },
+    {
+      "loader_family": "PackedSrPlusOrder5Gap",
+      "dll": "FUZZ_SMILE",
+      "crit": 212,
+      "packing": "packed",
+      "sr_i32": 236,
+      "sr_f64": 240,
+      "order5": 464,
+      "process_family": "Order5Process",
+      "notes": "packed SR plus distant order5"
+    },
+    {
+      "loader_family": "Order5ThenSrAligned",
+      "dll": "+Distortion",
+      "crit": 208,
+      "packing": "aligned",
+      "sr_i32": 552,
+      "sr_f64": 560,
+      "order5": 464,
+      "process_family": "Order5Process",
+      "notes": "live: order5@0x1d0 then aligned SR@0x228/0x230"
+    },
+    {
+      "loader_family": "SrF64Only",
+      "dll": "Tremolo",
+      "crit": 208,
+      "packing": "other",
+      "sr_i32": null,
+      "sr_f64": 240,
+      "order5": null,
+      "process_family": "ModDelayProcess",
+      "notes": "i32 SR absent; mod-delay cluster"
+    },
+    {
+      "loader_family": "UnknownLayout",
+      "dll": "Acoustic_Simulator",
+      "crit": 208,
+      "packing": "aligned",
+      "sr_i32": 280,
+      "sr_f64": 288,
+      "order5": 424,
+      "process_family": "HpsBody",
+      "notes": "live discover found aligned SR + order5; still HpsBody @0x318/0x328"
+    }
+  ]
+}
