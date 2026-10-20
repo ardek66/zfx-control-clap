@@ -4,7 +4,9 @@ pub mod log;
 mod peldr;
 mod protocol;
 
+use std::hint;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 struct DspWorkerState {
     _pe: peldr::PeModule,
@@ -622,16 +624,26 @@ fn main() {
                 }
                 continue;
             }
-            let bell = bridge.doorbell.load(Ordering::Acquire);
-            let submit = bridge.submit_seq.load(Ordering::Acquire);
-            let done = bridge.done_seq.load(Ordering::Relaxed);
-            if bridge.host_seq.load(Ordering::Acquire) != worker_seq || submit != done {
-                continue;
-            }
-            // SAFETY: `doorbell` is the bridge's wake word. The worker rechecks
-            // both sequences after loading it, so a missed wake is retried.
-            unsafe {
-                protocol::futex_wait(&raw const bridge.doorbell, bell, Some(100_000));
+            // Brief spin for submit/done or a doorbell bump before sleeping —
+            // cuts wake latency on small USB periods without burning a core.
+            let spin_deadline =
+                Instant::now() + Duration::from_micros(protocol::IPC_SPIN_US);
+            loop {
+                let bell = bridge.doorbell.load(Ordering::Acquire);
+                let submit = bridge.submit_seq.load(Ordering::Acquire);
+                let done = bridge.done_seq.load(Ordering::Relaxed);
+                if bridge.host_seq.load(Ordering::Acquire) != worker_seq || submit != done {
+                    break;
+                }
+                if Instant::now() >= spin_deadline {
+                    // SAFETY: `doorbell` is the bridge wake word; sequences are
+                    // rechecked after return so a missed wake is retried.
+                    unsafe {
+                        protocol::futex_wait(&raw const bridge.doorbell, bell, Some(100_000));
+                    }
+                    break;
+                }
+                hint::spin_loop();
             }
             continue;
         }
