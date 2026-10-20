@@ -3,12 +3,15 @@
 //! Both the 64-bit host (`zfx-bootstrap`) and the 32-bit worker (`zfx-worker32`)
 //! depend on this crate so the `ZfxSharedBridge` ABI cannot drift.
 
+use std::hint;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const BRIDGE_MAGIC: u32 = 0x5A46_5842; // 'ZFXB'
+/// Hybrid spin budget before futex sleep (host `wait_done` and worker doorbell idle).
+pub const IPC_SPIN_US: u64 = 30;
 pub const MAX_FRAMES: usize = 16384;
 pub const MAX_PARAMS: usize = 128;
 pub const MAX_PARAM_QUEUE: usize = 64;
@@ -274,16 +277,18 @@ impl ZfxSharedBridge {
 
     /// Wait until the worker has finished every block up through `target`.
     ///
-    /// Sleeps on `done_seq` until the target is reached or `timeout_us` of
-    /// wall time is spent. Intermediate completions (e.g. a late block from a
-    /// previous miss) re-enter the wait with the remaining budget so a chain
-    /// does not spuriously miss the block just published. Returns `false` on
-    /// timeout so a stuck DLL cannot hold the audio callback.
+    /// Spins on `done_seq` for the first [`IPC_SPIN_US`] of the budget (or the
+    /// whole budget if smaller), then sleeps on the futex for any remainder.
+    /// Intermediate completions re-enter with the remaining wall budget so a
+    /// late prior block does not spuriously miss the one just published.
+    /// Returns `false` on timeout so a stuck DLL cannot hold the audio callback.
     pub fn wait_done(&self, target: u32, timeout_us: u64) -> bool {
         if timeout_us == 0 {
             return seq_reached(self.done_seq.load(Ordering::Acquire), target);
         }
-        let deadline = Instant::now() + Duration::from_micros(timeout_us);
+        let start = Instant::now();
+        let deadline = start + Duration::from_micros(timeout_us);
+        let spin_deadline = start + Duration::from_micros(timeout_us.min(IPC_SPIN_US));
         loop {
             let done = self.done_seq.load(Ordering::Acquire);
             if seq_reached(done, target) {
@@ -292,6 +297,10 @@ impl ZfxSharedBridge {
             let now = Instant::now();
             if now >= deadline {
                 return false;
+            }
+            if now < spin_deadline {
+                hint::spin_loop();
+                continue;
             }
             let remaining_us = u64::try_from(deadline.saturating_duration_since(now).as_micros())
                 .unwrap_or(0)
