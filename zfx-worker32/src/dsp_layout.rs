@@ -1008,6 +1008,100 @@ impl<'a> MemoryView<'a> {
     }
 }
 
+/// `Auto_Wah`: object-level wah multiplier offset (`this+0x1c8`).
+pub const WAH_MULT_AUTO_WAH: usize = 0x1c8;
+/// `PEDAL_CRY`: object-level wah multiplier offset (`this+0x1e0`).
+pub const WAH_MULT_PEDAL_CRY: usize = 0x1e0;
+/// HPS pitch buffer pointer slot used when `sr_i32` is at `0xec`.
+pub const HPS_SR_BUFFER_PTR_OFFSET: usize = 0x148;
+/// Pitch/HPS packed SR i32 offset that owns the HPS buffer at [`HPS_SR_BUFFER_PTR_OFFSET`].
+pub const HPS_SR_I32_OWNS_BUFFER: usize = 0xec;
+/// Order5 channel sub-object pointer scan window (relative to `this`).
+pub const ORDER5_SUBOBJ_PTR_SCAN: std::ops::Range<usize> = 0x100..0x200;
+
+/// Apply `Auto_Wah` / `PEDAL_CRY` leaf side-effects after writing the primary wah multiplier.
+///
+/// # Safety
+/// `obj_u8` must point at a live DSP object large enough for the leaf offsets; heap sub-object
+/// pointers are validated via `is_plausible` before dereference.
+pub unsafe fn apply_wah_leaf_sr_side_effects(
+    obj_u8: *mut u8,
+    wah_off: usize,
+    ratio: f64,
+    is_plausible: impl Fn(usize) -> bool,
+) {
+    // SAFETY: Caller guarantees `obj_u8` covers the leaf offset clusters below.
+    unsafe {
+        match wah_off {
+            WAH_MULT_AUTO_WAH => {
+                std::ptr::write_unaligned(obj_u8.add(0x1a8).cast::<f64>(), 0.005 * ratio);
+                std::ptr::write_unaligned(obj_u8.add(0x1b0).cast::<f64>(), 0.03 * ratio);
+
+                let p_sub1 = std::ptr::read_unaligned(obj_u8.add(0x134).cast::<*mut u8>());
+                if is_plausible(p_sub1 as usize) {
+                    let mut params: WahResonatorParams = std::ptr::read_unaligned(p_sub1.cast());
+                    params.param1 = 0.137_812_5 * ratio;
+                    std::ptr::write_unaligned(p_sub1.cast(), params);
+                }
+                let p_sub3 = std::ptr::read_unaligned(obj_u8.add(0x13c).cast::<*mut u8>());
+                if is_plausible(p_sub3 as usize) {
+                    let mut params: WahResonatorParams = std::ptr::read_unaligned(p_sub3.cast());
+                    params.param1 = 0.55 * ratio;
+                    params.param2 = 0.1 * ratio;
+                    std::ptr::write_unaligned(p_sub3.cast(), params);
+                }
+            }
+            WAH_MULT_PEDAL_CRY => {
+                let p_sub0 = std::ptr::read_unaligned(obj_u8.add(0x114).cast::<*mut u8>());
+                if is_plausible(p_sub0 as usize) {
+                    let mut params: WahResonatorParams = std::ptr::read_unaligned(p_sub0.cast());
+                    params.param1 = 0.5 * ratio;
+                    params.param2 = 0.05 * ratio;
+                    std::ptr::write_unaligned(p_sub0.cast(), params);
+                }
+                std::ptr::write_unaligned(obj_u8.add(0x1a0).cast::<f64>(), 0.5 * ratio);
+                std::ptr::write_unaligned(obj_u8.add(0x1e8).cast::<f64>(), 0.5 * ratio);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Re-warp `Order5` coefficients at `order5_off` and matching channel heap sub-objects.
+///
+/// # Safety
+/// `obj_u8` must cover `order5_off` and the [`ORDER5_SUBOBJ_PTR_SCAN`] pointer window.
+pub unsafe fn apply_order5_sr_adaptation(
+    obj_u8: *mut u8,
+    order5_off: usize,
+    target_coeffs: Order5Coeffs,
+    is_plausible: impl Fn(usize) -> bool,
+) {
+    // SAFETY: Caller guarantees `order5_off` and sub-object pointer window are in-bounds.
+    unsafe {
+        std::ptr::write_unaligned(obj_u8.add(order5_off).cast::<Order5Coeffs>(), target_coeffs);
+
+        for sub_off in ORDER5_SUBOBJ_PTR_SCAN.step_by(4) {
+            let p_sub = std::ptr::read_unaligned(obj_u8.add(sub_off).cast::<*mut u8>());
+            if is_plausible(p_sub as usize) {
+                let mut sub_obj = std::ptr::read_unaligned(p_sub.cast::<Order5SubObject>());
+                if (4.0..5.5).contains(&sub_obj.coeffs.a[0])
+                    && (0.5..0.98).contains(&sub_obj.coeffs.a[4])
+                {
+                    sub_obj.coeffs = target_coeffs;
+                    std::ptr::write_unaligned(p_sub.cast::<Order5SubObject>(), sub_obj);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a Pitch-family `sr_i32` offset owns the HPS delay buffer at [`HPS_SR_BUFFER_PTR_OFFSET`].
+#[must_use]
+pub const fn pitch_sr_owns_hps_buffer(dsp_family: DspFamily, sr_i32_offset: usize) -> bool {
+    matches!(dsp_family, DspFamily::Pitch) && sr_i32_offset == HPS_SR_I32_OWNS_BUFFER
+}
+
 const _: () = assert!(std::mem::size_of::<Order5Coeffs>() == 88);
 const _: () = assert!(std::mem::size_of::<BiquadCoeffs>() == 40);
 // BassMan / Tangerine relative adjacency: Order5 (88) immediately precedes aligned SR.
