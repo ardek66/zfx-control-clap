@@ -6,6 +6,7 @@
 )]
 
 pub mod gui;
+pub mod ipc_timing;
 pub mod params;
 pub mod protocol;
 #[cfg(feature = "feat_oversampling")]
@@ -89,6 +90,8 @@ pub struct ZfxShared {
     pub block_latency: std::sync::atomic::AtomicU32,
     /// Audio thread sets this when `block_latency` changes; main thread notifies host.
     pub latency_dirty: std::sync::atomic::AtomicBool,
+    /// Publish→done wait samples / hit-miss counters (audio writes, main drains).
+    pub ipc_timing: std::sync::Arc<ipc_timing::IpcTimingStats>,
     #[cfg(feature = "feat_oversampling")]
     pub oversampling_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     #[cfg(feature = "feat_oversampling")]
@@ -220,6 +223,8 @@ pub struct ZfxMainThread<'a> {
 }
 impl<'a> PluginMainThread<'a, ZfxShared> for ZfxMainThread<'a> {
     fn on_main_thread(&self) {
+        // Off-RT drain of publish→done samples (see `ipc_timing`).
+        self.shared.ipc_timing.drain_log();
         if self.shared.latency_dirty.swap(false, Ordering::AcqRel) {
             if let Some(host_latency) = self
                 .host
@@ -1298,7 +1303,18 @@ impl ZfxAudioProcessor<'_> {
         self.commit_params(batch);
         let target = bridge.submit_seq.load(Ordering::Acquire);
         let budget = self.block_budget_us(frames_u32, os_factor);
+        let wait_start = std::time::Instant::now();
         let hit = bridge.wait_done(target, budget);
+        let wait_us = u32::try_from(wait_start.elapsed().as_micros()).unwrap_or(u32::MAX);
+        if self.shared.ipc_timing.record(
+            self.live_block.max(frames_u32),
+            os_factor,
+            wait_us,
+            hit,
+        ) {
+            // First sample since last main-thread drain — wake once to log.
+            self.host.shared().request_callback();
+        }
 
         if spilled {
             if hit {
@@ -2282,6 +2298,7 @@ impl clack_plugin::entry::DefaultPluginFactory for ZfxBootstrapPlugin {
             is_active: std::sync::atomic::AtomicBool::new(false),
             block_latency: std::sync::atomic::AtomicU32::new(0),
             latency_dirty: std::sync::atomic::AtomicBool::new(false),
+            ipc_timing: std::sync::Arc::new(ipc_timing::IpcTimingStats::new()),
             #[cfg(feature = "feat_oversampling")]
             oversampling_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 resampler::OversamplingMode::Off.to_u8(),
