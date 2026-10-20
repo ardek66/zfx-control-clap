@@ -4,6 +4,7 @@
 //! depend on this crate so the `ZfxSharedBridge` ABI cannot drift.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -17,12 +18,14 @@ pub const CMD_IDLE: u32 = 0;
 pub const CMD_INIT: u32 = 1;
 pub const CMD_SHUTDOWN: u32 = 3;
 
-/// Audio block. The host plays it back one callback later.
+/// Audio block. The host waits in the same callback and plays this block's output.
 pub const SLOT_AUDIO: u8 = 0;
 /// Parameter update with no samples. The host does not play it back.
 pub const SLOT_PARAMS: u8 = 1;
 
-/// Two in-flight blocks: the one the worker is finishing, and the one the host is filling.
+/// Depth-2 queue: one slot may still be finishing after a miss while the host
+/// publishes the next block. When spilled, the host plays the prior finished
+/// block and reports one live block via `clap.latency`.
 pub const SLOT_COUNT: usize = 2;
 
 pub const STATUS_READY: u32 = 0;
@@ -94,7 +97,8 @@ pub struct CollectedBlock {
 ///
 /// Control commands (`CMD_INIT`, `CMD_SHUTDOWN`) use `host_seq` / `worker_seq`.
 /// Audio uses `submit_seq` / `done_seq` and [`slots`](Self::slots). The host
-/// publishes a block and waits until that same block is finished.
+/// publishes a block and waits in-callback up to a curve budget; on miss it
+/// plays a prior finished block and reports one live block via `clap.latency`.
 #[repr(C, align(8))]
 pub struct ZfxSharedBridge {
     pub magic: u32,
@@ -200,49 +204,101 @@ impl ZfxSharedBridge {
     ) -> Option<CollectedBlock> {
         let done = self.done_seq.load(Ordering::Acquire);
         while done.wrapping_sub(*collected) > 0 {
-            let index = slot_index(*collected);
-            // SAFETY: the host is the only collector. The worker has stored
-            // `done_seq` past this block and will not write it again until the
-            // host publishes over it, which happens only after this copy.
-            let slot = unsafe { &*self.slots.as_ptr().add(index) };
-            let kind = slot.kind;
-            let info = CollectedBlock {
-                host_frames: slot.host_frames,
-                dsp_frames: slot.num_frames,
-                os_factor: slot.os_factor,
-            };
-            if kind == SLOT_PARAMS {
-                *collected = collected.wrapping_add(1);
-                continue;
+            if let Some(info) = self.take_finished(collected, left, right, true) {
+                return Some(info);
             }
+        }
+        None
+    }
+
+    /// Play the audio for `target` (`done_seq` value after that block finished).
+    ///
+    /// Older finished blocks — including late finishes from a previous miss —
+    /// are discarded so the host never introduces a one-block delay.
+    pub fn collect_target(
+        &self,
+        collected: &mut u32,
+        target: u32,
+        left: &mut [f32],
+        right: &mut [f32],
+    ) -> Option<CollectedBlock> {
+        if !seq_reached(self.done_seq.load(Ordering::Acquire), target) {
+            return None;
+        }
+        let mut played = None;
+        while target.wrapping_sub(*collected) > 0 {
+            let keep = collected.wrapping_add(1) == target;
+            if let Some(info) = self.take_finished(collected, left, right, keep) {
+                played = Some(info);
+            }
+        }
+        played
+    }
+
+    /// Advance `collected` over one finished slot. When `keep` is set and the
+    /// slot is audio, copy it into `left` / `right`.
+    fn take_finished(
+        &self,
+        collected: &mut u32,
+        left: &mut [f32],
+        right: &mut [f32],
+        keep: bool,
+    ) -> Option<CollectedBlock> {
+        let index = slot_index(*collected);
+        // SAFETY: the host is the only collector. The worker has stored
+        // `done_seq` past this block and will not write it again until the
+        // host publishes over it, which happens only after this cursor moves.
+        let slot = unsafe { &*self.slots.as_ptr().add(index) };
+        let kind = slot.kind;
+        let info = CollectedBlock {
+            host_frames: slot.host_frames,
+            dsp_frames: slot.num_frames,
+            os_factor: slot.os_factor,
+        };
+        *collected = collected.wrapping_add(1);
+        if kind == SLOT_PARAMS {
+            return None;
+        }
+        if keep {
             let dsp_frames = usize::try_from(info.dsp_frames)
                 .unwrap_or(0)
                 .min(MAX_FRAMES);
             let copy_n = dsp_frames.min(left.len()).min(right.len());
             copy_clamped(&slot.out_l[..copy_n], &mut left[..copy_n]);
             copy_clamped(&slot.out_r[..copy_n], &mut right[..copy_n]);
-            *collected = collected.wrapping_add(1);
-            return Some(info);
+            Some(info)
+        } else {
+            None
         }
-        None
     }
 
     /// Wait until the worker has finished every block up through `target`.
     ///
-    /// Checks once, then sleeps in the kernel at most once for up to
-    /// `timeout_us`. Returns `false` on timeout so a stuck DLL cannot hold the
-    /// audio callback. The caller may run on the audio thread.
+    /// Sleeps on `done_seq` until the target is reached or `timeout_us` of
+    /// wall time is spent. Intermediate completions (e.g. a late block from a
+    /// previous miss) re-enter the wait with the remaining budget so a chain
+    /// does not spuriously miss the block just published. Returns `false` on
+    /// timeout so a stuck DLL cannot hold the audio callback.
     pub fn wait_done(&self, target: u32, timeout_us: u64) -> bool {
-        let done = self.done_seq.load(Ordering::Acquire);
-        if seq_reached(done, target) {
-            return true;
-        }
         if timeout_us == 0 {
-            return false;
+            return seq_reached(self.done_seq.load(Ordering::Acquire), target);
         }
-        // SAFETY: `done_seq` is an aligned atomic in this bridge allocation.
-        unsafe { futex_wait(&raw const self.done_seq, done, Some(timeout_us)) }
-        seq_reached(self.done_seq.load(Ordering::Acquire), target)
+        let deadline = Instant::now() + Duration::from_micros(timeout_us);
+        loop {
+            let done = self.done_seq.load(Ordering::Acquire);
+            if seq_reached(done, target) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let remaining_us = u64::try_from(deadline.saturating_duration_since(now).as_micros())
+                .unwrap_or(0)
+                .max(1);
+            // SAFETY: `done_seq` is an aligned atomic in this bridge allocation.
+            unsafe { futex_wait(&raw const self.done_seq, done, Some(remaining_us)) }
+        }
     }
 
     /// Drop finished blocks without copying them. Used while bypassed.
@@ -476,6 +532,49 @@ mod tests {
             .collect_output(&mut collected, &mut left, &mut right)
             .is_none());
         assert_eq!(collected, 1);
+    }
+
+    #[test]
+    fn collect_target_discards_older_audio() {
+        let bridge = aligned_bridge();
+        let mut collected = 0u32;
+
+        assert!(bridge.try_publish(collected, |slot| {
+            slot.kind = SLOT_AUDIO;
+            slot.num_frames = 1;
+            slot.host_frames = 1;
+            slot.out_l[0] = 1.0;
+            slot.out_r[0] = 1.0;
+            slot.in_l[0] = 1.0;
+        }));
+        {
+            let mut claimed = bridge.claim_block().expect("first");
+            claimed.slot().out_l[0] = 1.0;
+            claimed.slot().out_r[0] = 1.0;
+        }
+
+        assert!(bridge.try_publish(collected, |slot| {
+            slot.kind = SLOT_AUDIO;
+            slot.num_frames = 1;
+            slot.host_frames = 1;
+            slot.in_l[0] = 2.0;
+        }));
+        {
+            let mut claimed = bridge.claim_block().expect("second");
+            claimed.slot().out_l[0] = 2.0;
+            claimed.slot().out_r[0] = 2.0;
+        }
+
+        let target = bridge.submit_seq.load(Ordering::Acquire);
+        let mut left = [0.0f32; 1];
+        let mut right = [0.0f32; 1];
+        let got = bridge
+            .collect_target(&mut collected, target, &mut left, &mut right)
+            .expect("target audio");
+        assert_eq!(got.dsp_frames, 1);
+        assert_eq!(left[0], 2.0);
+        assert_eq!(right[0], 2.0);
+        assert_eq!(collected, target);
     }
 
     fn aligned_bridge() -> Box<ZfxSharedBridge> {

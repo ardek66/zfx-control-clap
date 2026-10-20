@@ -84,11 +84,10 @@ pub struct ZfxShared {
     pub param_values: std::sync::Arc<params::ParamStore>,
     pub gui_events: std::sync::Arc<std::sync::Mutex<Vec<GuiParamEvent>>>,
     pub is_active: std::sync::atomic::AtomicBool,
-    /// Extra delay, in samples, while the host is sending blocks larger than
-    /// the live buffer. Zero during normal same-callback rendering.
+    /// One live block of delay while spilled to next-callback playback.
+    /// Reported through `clap.latency` so the host can PDC-compensate.
     pub block_latency: std::sync::atomic::AtomicU32,
-    /// Set on the audio thread when `block_latency` changes. The main thread
-    /// clears it and tells the host to re-read the latency.
+    /// Audio thread sets this when `block_latency` changes; main thread notifies host.
     pub latency_dirty: std::sync::atomic::AtomicBool,
     #[cfg(feature = "feat_oversampling")]
     pub oversampling_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -221,11 +220,7 @@ pub struct ZfxMainThread<'a> {
 }
 impl<'a> PluginMainThread<'a, ZfxShared> for ZfxMainThread<'a> {
     fn on_main_thread(&self) {
-        if self
-            .shared
-            .latency_dirty
-            .swap(false, Ordering::AcqRel)
-        {
+        if self.shared.latency_dirty.swap(false, Ordering::AcqRel) {
             if let Some(host_latency) = self
                 .host
                 .get_extension::<clack_extensions::latency::HostLatency>()
@@ -826,19 +821,33 @@ impl Default for BlockTransport {
     }
 }
 
-/// Smallest practical USB device block used as the fill-curve floor.
-const WAIT_FILL_F0_FRAMES: f64 = 64.0;
-/// Fill at [`WAIT_FILL_F0_FRAMES`]: enough for one IPC turn on that quantum.
-const WAIT_FILL_EPS: f64 = 0.30;
-/// Asymptote of fill as block size → ∞ (never a hard cap; spill recovers misses).
-const WAIT_FILL_L: f64 = 0.50;
-/// Block size where fill sits halfway between [`WAIT_FILL_EPS`] and [`WAIT_FILL_L`].
-const WAIT_FILL_N_HALF: f64 = 256.0;
+/// Fill-curve floor (frames). With `F0 = 1`, the log ratio is just `log2(frames)`.
+const WAIT_FILL_F0_FRAMES: f64 = 1.0;
+/// Fill at [`WAIT_FILL_F0_FRAMES`]. Must stay below [`WAIT_FILL_L`].
+const WAIT_FILL_EPS: f64 = 0.05;
+/// Asymptote of fill as the curve argument → ∞. Caps one instance's wait so a
+/// serial multi-FX chain still fits in one host quantum: worst-case
+/// `N * L ≤ 1`. Sized for ~8–10 ZFX in series (amps/distortion often at 4× OS);
+/// 4× only moves right on this curve, still bounded by `L`.
+const WAIT_FILL_L: f64 = 0.10;
+/// Argument where fill sits halfway between [`WAIT_FILL_EPS`] and [`WAIT_FILL_L`].
+const WAIT_FILL_N_HALF: f64 = 512.0;
+/// Consecutive same-callback hits required before clearing PDC spill.
+/// Stops `clap.latency` flickering 0 ↔ live under marginal load.
+const PIPELINE_EXIT_HITS: u8 = 2;
 
 /// Fraction of block wall-time allowed for one same-callback futex wait.
 ///
 /// `fill(F0) = eps`, `fill → L` as `frames → ∞`, halfway at `N_half`:
 /// `fill = L - (L - eps) / (1 + log2(max(frames, F0) / F0) / log2(N_half / F0))`.
+///
+/// Oversampling is folded in by evaluating at `host_frames * os_factor`: more DSP
+/// work moves right on the same curve, still bounded by `L`.
+///
+/// The curve is the gate for **when** to escalate: wait up to `B`, and on miss
+/// spill one `live_block` of delay reported via `clap.latency` (PDC). At small
+/// device buffers that extra block is only a few milliseconds and is preferable
+/// to dropouts in a multi-FX chain.
 fn wait_fill(frames: f64) -> f64 {
     let frames = frames.max(1.0);
     let u = (frames.max(WAIT_FILL_F0_FRAMES) / WAIT_FILL_F0_FRAMES).log2();
@@ -863,6 +872,11 @@ pub struct ZfxAudioProcessor<'a> {
     pub in_r: Vec<f32>,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
+    /// Scratch for `pull_ready` when oversampling is off (OS builds use `os_out_*`).
+    #[cfg(not(feature = "feat_oversampling"))]
+    hold_l: Vec<f32>,
+    #[cfg(not(feature = "feat_oversampling"))]
+    hold_r: Vec<f32>,
     #[cfg(feature = "feat_oversampling")]
     pub os_in_l: Vec<f32>,
     #[cfg(feature = "feat_oversampling")]
@@ -877,9 +891,12 @@ pub struct ZfxAudioProcessor<'a> {
     host: HostAudioProcessorHandle<'a>,
     /// Blocks this processor has copied back from the worker.
     pub collected: u32,
-    /// Last steady device block size. Larger host callbacks pipeline instead
-    /// of updating this, so anticipative chunks do not raise the wait budget.
+    /// Settled device block size for the wait-fill curve and PDC spill unit.
+    /// Anticipative host chunks larger than this do not raise the budget or the
+    /// reported block latency.
     live_block: u32,
+    /// Clean same-callback hits while spilled. Exit PDC after [`PIPELINE_EXIT_HITS`].
+    spill_hits: u8,
     bypass: BypassMode,
     /// Normalized values last sent to the worker. `f32::NAN` = never sent.
     /// Parallel to `shared.params`.
@@ -1010,35 +1027,36 @@ impl ZfxAudioProcessor<'_> {
         })
     }
 
-    /// Drop a block left behind by a timed-out render so this callback can
-    /// publish the samples the host just delivered.
-    fn ready_for_new_block(
-        &mut self,
-        bridge: &protocol::ZfxSharedBridge,
-        timeout_us: u64,
-    ) -> bool {
-        bridge.skip_finished(&mut self.collected);
-        let submit = bridge.submit_seq.load(Ordering::Acquire);
-        if bridge.done_seq.load(Ordering::Acquire) == submit {
+    /// Adopt or shrink the settled live size. Never grows on anticipative chunks.
+    /// Returns `true` when the host callback is larger than live (lookahead) and
+    /// this callback should run in PDC-spill mode.
+    fn settle_live_block(&mut self, frames: u32) -> bool {
+        if frames == 0 {
+            return self.pipeline_active();
+        }
+        if self.live_block == 0 {
+            self.live_block = frames;
+            return false;
+        }
+        if frames < self.live_block {
+            self.live_block = frames;
+            if self.pipeline_active() {
+                self.enter_pipeline();
+            }
+            return self.pipeline_active();
+        }
+        if frames > self.live_block {
+            self.enter_pipeline();
             return true;
         }
-        if bridge.wait_done(submit, timeout_us) {
-            bridge.skip_finished(&mut self.collected);
-            true
-        } else {
-            false
-        }
+        self.pipeline_active()
     }
 
     /// Same-callback futex budget for one publish→done wait.
     ///
-    /// Wall time of the settled device block (`live_block`, else `frames`) is
-    /// scaled by a fill that starts at [`WAIT_FILL_EPS`] on the USB floor
-    /// [`WAIT_FILL_F0_FRAMES`] and approaches [`WAIT_FILL_L`] as size → ∞
-    /// (half the remaining gap closed at [`WAIT_FILL_N_HALF`] frames). Larger
-    /// host chunks do not raise the budget; miss recovery stays on the
-    /// one-block spill path.
-    fn block_budget_us(&self, frames: u32) -> u64 {
+    /// `B = T_live * wait_fill(live_frames * os_factor)`, with `wait_fill → L`.
+    /// Exceeding `B` is the signal to raise `clap.latency` by one live block.
+    fn block_budget_us(&self, frames: u32, os_factor: u8) -> u64 {
         let rate_hz = if self.host_sample_rate.is_finite() && self.host_sample_rate > 1.0 {
             self.host_sample_rate.round().max(1.0)
         } else {
@@ -1050,7 +1068,8 @@ impl ZfxAudioProcessor<'_> {
             f64::from(frames.max(1))
         };
         let block_us = sized * 1_000_000.0 / rate_hz;
-        let budget = (block_us * wait_fill(sized)).floor();
+        let fill = wait_fill(sized * f64::from(os_factor.max(1)));
+        let budget = (block_us * fill).floor();
         if budget.is_finite() && budget > 0.0 {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             {
@@ -1069,63 +1088,48 @@ impl ZfxAudioProcessor<'_> {
         }
     }
 
-    fn note_live_miss(&self, frames: u32) {
-        let samples = if self.live_block > 0 {
-            self.live_block
-        } else {
-            frames
-        };
-        self.set_block_latency(samples.max(1));
-    }
-
-    fn note_pipeline_success(&self) {
-        self.set_block_latency(0);
-    }
-
-    /// `true` when this callback should play the previous finished block and
-    /// hold the new one (host grew past live size, or a live wait miss).
-    fn observe_block(&mut self, frames: u32) -> bool {
-        if frames == 0 {
-            return self.shared.block_latency.load(Ordering::Acquire) > 0;
-        }
-        if self.live_block == 0 {
-            self.live_block = frames;
-            return false;
-        }
-        if frames < self.live_block {
-            self.live_block = frames;
-        } else if frames > self.live_block {
-            self.set_block_latency(frames);
-            return true;
-        }
+    fn pipeline_active(&self) -> bool {
         self.shared.block_latency.load(Ordering::Acquire) > 0
     }
 
-    /// Copy the finished block into `out_l` / `out_r`. Missing audio stays silent.
-    fn pull_output(&mut self, bridge: &protocol::ZfxSharedBridge, host_frames: usize) {
+    fn enter_pipeline(&mut self) {
+        self.spill_hits = 0;
+        self.set_block_latency(self.live_block.max(1));
+    }
+
+    fn exit_pipeline(&mut self) {
+        self.spill_hits = 0;
+        self.set_block_latency(0);
+    }
+
+    /// Count a catch-up hit while spilled. Clears PDC only after a short streak
+    /// so marginal load cannot bounce host latency every block.
+    fn note_spill_hit(
+        &mut self,
+        bridge: &protocol::ZfxSharedBridge,
+        target: u32,
+        frames: usize,
+    ) {
+        self.spill_hits = self.spill_hits.saturating_add(1);
+        if self.spill_hits >= PIPELINE_EXIT_HITS {
+            self.pull_target(bridge, target, frames);
+            self.exit_pipeline();
+        }
+        // Else keep the early-pull outs; reported PDC stays until the streak lands.
+    }
+
+    fn clear_output(&mut self, host_frames: usize) {
         let count = host_frames.min(self.out_l.len()).min(self.out_r.len());
         self.out_l[..count].fill(0.0);
         self.out_r[..count].fill(0.0);
+    }
 
-        #[cfg(not(feature = "feat_oversampling"))]
-        {
-            let _ = bridge.collect_output(&mut self.collected, &mut self.out_l, &mut self.out_r);
-        }
-
-        #[cfg(feature = "feat_oversampling")]
-        let Some(block) = bridge.collect_output(
-            &mut self.collected,
-            &mut self.os_out_l,
-            &mut self.os_out_r,
-        ) else {
-            return;
-        };
-
-        #[cfg(feature = "feat_oversampling")]
+    /// Decode a collected worker block from `os_out_*` into host outs.
+    #[cfg(feature = "feat_oversampling")]
+    fn apply_collected(&mut self, block: protocol::CollectedBlock, host_frames: usize) {
+        let count = host_frames.min(self.out_l.len()).min(self.out_r.len());
         let block_host = usize::try_from(block.host_frames).unwrap_or(0);
-        #[cfg(feature = "feat_oversampling")]
         let dsp_frames = usize::try_from(block.dsp_frames).unwrap_or(0);
-        #[cfg(feature = "feat_oversampling")]
         if block.os_factor <= 1 {
             let n = block_host
                 .min(dsp_frames)
@@ -1136,20 +1140,178 @@ impl ZfxAudioProcessor<'_> {
             self.out_r[..n].copy_from_slice(&self.os_out_r[..n]);
             return;
         }
-
-        #[cfg(feature = "feat_oversampling")]
         if block_host > 0
             && block_host <= count
             && dsp_frames == block_host * usize::from(block.os_factor)
             && dsp_frames <= self.os_out_l.len()
-            && self.oversampler.mode().factor() == usize::from(block.os_factor)
         {
+            let prev_mode = self.oversampler.mode();
+            let prev_phase = self.oversampler.phase();
+            let block_mode = match block.os_factor {
+                2 => resampler::OversamplingMode::Double,
+                4 => resampler::OversamplingMode::Quad,
+                _ => resampler::OversamplingMode::Off,
+            };
+            self.oversampler.set_config(block_mode, prev_phase);
             self.oversampler.downsample(
                 &self.os_out_l[..dsp_frames],
                 &self.os_out_r[..dsp_frames],
                 &mut self.out_l[..block_host],
                 &mut self.out_r[..block_host],
             );
+            self.oversampler.set_config(prev_mode, prev_phase);
+        }
+    }
+
+    /// Play the oldest finished audio (PDC-spill / early pull).
+    ///
+    /// Returns `true` when a block was applied. On `false`, existing outs are
+    /// left untouched so a miss can hold the last good audio.
+    fn pull_ready(&mut self, bridge: &protocol::ZfxSharedBridge, host_frames: usize) -> bool {
+        #[cfg(feature = "feat_oversampling")]
+        {
+            let Some(block) = bridge.collect_output(
+                &mut self.collected,
+                &mut self.os_out_l,
+                &mut self.os_out_r,
+            ) else {
+                return false;
+            };
+            self.clear_output(host_frames);
+            self.apply_collected(block, host_frames);
+            true
+        }
+
+        #[cfg(not(feature = "feat_oversampling"))]
+        {
+            let count = host_frames.min(self.out_l.len()).min(self.out_r.len());
+            self.hold_l[..count].fill(0.0);
+            self.hold_r[..count].fill(0.0);
+            if bridge
+                .collect_output(
+                    &mut self.collected,
+                    &mut self.hold_l[..count],
+                    &mut self.hold_r[..count],
+                )
+                .is_some()
+            {
+                self.out_l[..count].copy_from_slice(&self.hold_l[..count]);
+                self.out_r[..count].copy_from_slice(&self.hold_r[..count]);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Play exactly `target`, discarding older finished blocks if needed.
+    fn pull_target(
+        &mut self,
+        bridge: &protocol::ZfxSharedBridge,
+        target: u32,
+        host_frames: usize,
+    ) {
+        self.clear_output(host_frames);
+
+        #[cfg(not(feature = "feat_oversampling"))]
+        {
+            let _ = bridge.collect_target(
+                &mut self.collected,
+                target,
+                &mut self.out_l,
+                &mut self.out_r,
+            );
+        }
+
+        #[cfg(feature = "feat_oversampling")]
+        if let Some(block) = bridge.collect_target(
+            &mut self.collected,
+            target,
+            &mut self.os_out_l,
+            &mut self.os_out_r,
+        ) {
+            self.apply_collected(block, host_frames);
+        }
+    }
+
+    /// Curve-budget same-callback wait; on miss / lookahead escalate to one
+    /// `live_block` of `clap.latency` and play from the spill queue.
+    #[allow(clippy::too_many_arguments)]
+    fn render_through_worker(
+        &mut self,
+        bridge: &protocol::ZfxSharedBridge,
+        frames: usize,
+        frames_u32: u32,
+        dsp_frames: usize,
+        os_factor: u8,
+        #[cfg(feature = "feat_oversampling")] use_oversampling: bool,
+        stereo: bool,
+        transport: BlockTransport,
+        batch: &ParamBatch,
+    ) {
+        let spilled = self.settle_live_block(frames_u32);
+        if spilled {
+            // Already one block behind: play whatever the worker finished last.
+            self.pull_ready(bridge, frames);
+        }
+        // Not spilled: leave prior outs in place so a miss holds last audio
+        // instead of emitting a silent hole while escalating to PDC.
+
+        #[allow(clippy::cast_possible_truncation)]
+        let sample_rate = self.host_sample_rate as f32 * f32::from(os_factor);
+        let collected = self.collected;
+        let published = {
+            #[cfg(feature = "feat_oversampling")]
+            let (left, right_feed) = if use_oversampling {
+                (&self.os_in_l[..dsp_frames], &self.os_in_r[..dsp_frames])
+            } else {
+                (&self.in_l[..dsp_frames], &self.in_r[..dsp_frames])
+            };
+            #[cfg(not(feature = "feat_oversampling"))]
+            let (left, right_feed) = (&self.in_l[..dsp_frames], &self.in_r[..dsp_frames]);
+            let right: &[f32] = if stereo { right_feed } else { left };
+            Self::write_block(
+                bridge,
+                collected,
+                &OutgoingBlock {
+                    kind: protocol::SLOT_AUDIO,
+                    host_frames: frames_u32,
+                    os_factor,
+                    sample_rate,
+                    left,
+                    right,
+                    transport,
+                    batch,
+                },
+            )
+        };
+
+        if !published {
+            // Prefer a finished worker block; otherwise keep holding last outs.
+            if !spilled {
+                let _ = self.pull_ready(bridge, frames);
+            }
+            self.enter_pipeline();
+            return;
+        }
+
+        self.commit_params(batch);
+        let target = bridge.submit_seq.load(Ordering::Acquire);
+        let budget = self.block_budget_us(frames_u32, os_factor);
+        let hit = bridge.wait_done(target, budget);
+
+        if spilled {
+            if hit {
+                self.note_spill_hit(bridge, target, frames);
+            } else {
+                self.spill_hits = 0;
+            }
+            // Miss while spilled: keep early-pull audio; PDC stays.
+        } else if hit {
+            self.pull_target(bridge, target, frames);
+        } else {
+            // Curve says stop waiting: escalate to PDC while holding last outs.
+            self.enter_pipeline();
         }
     }
 }
@@ -1287,6 +1449,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             in_r: vec![0.0; max_frames],
             out_l: vec![0.0; max_frames],
             out_r: vec![0.0; max_frames],
+            #[cfg(not(feature = "feat_oversampling"))]
+            hold_l: vec![0.0; max_frames],
+            #[cfg(not(feature = "feat_oversampling"))]
+            hold_r: vec![0.0; max_frames],
             #[cfg(feature = "feat_oversampling")]
             os_in_l: vec![0.0; max_os_frames],
             #[cfg(feature = "feat_oversampling")]
@@ -1301,6 +1467,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             host,
             collected,
             live_block: 0,
+            spill_hits: 0,
             bypass: BypassMode::resolve(&shared.params),
             last_sent_norm: vec![f32::NAN; shared.params.len()],
         })
@@ -1457,19 +1624,7 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                 }
 
                 if frames > 0 {
-                    let bridge_ptr = self.shared.bridge_ptr;
                     let frames_u32 = u32::try_from(frames).unwrap_or(0);
-                    let extended = self.observe_block(frames_u32);
-                    if extended && !bridge_ptr.is_null() {
-                        // SAFETY: non-null mapped bridge. Pulled before the
-                        // oversampler is retuned, so this block still matches
-                        // the mode it was rendered with.
-                        let bridge = unsafe { &*bridge_ptr };
-                        self.pull_output(bridge, frames);
-                    } else {
-                        self.out_l[..frames].fill(0.0);
-                        self.out_r[..frames].fill(0.0);
-                    }
 
                     #[cfg(feature = "feat_oversampling")]
                     let (dsp_frames, use_oversampling) = {
@@ -1506,68 +1661,26 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
                     .unwrap_or(1);
                     #[cfg(not(feature = "feat_oversampling"))]
                     let os_factor = 1u8;
-                    if !bridge_ptr.is_null() {
-                        // SAFETY: non-null mapped bridge. The pointer is copied so
-                        // the following `&mut self` calls do not alias it.
+
+                    let bridge_ptr = self.shared.bridge_ptr;
+                    if bridge_ptr.is_null() {
+                        self.clear_output(frames);
+                    } else {
+                        // SAFETY: non-null mapped bridge. Pointer copied so
+                        // `&mut self` below does not alias it.
                         let bridge = unsafe { &*bridge_ptr };
-                        let budget = self.block_budget_us(frames_u32);
-                        if extended || self.ready_for_new_block(bridge, budget) {
-                        let collected = self.collected;
-                        let host_frames = frames_u32;
-                        #[allow(clippy::cast_possible_truncation)]
-                        let sample_rate = self.host_sample_rate as f32 * f32::from(os_factor);
-                        let published = {
+                        self.render_through_worker(
+                            bridge,
+                            frames,
+                            frames_u32,
+                            clamped_dsp_frames,
+                            os_factor,
                             #[cfg(feature = "feat_oversampling")]
-                            let (left, right_feed) = if use_oversampling {
-                                (
-                                    &self.os_in_l[..clamped_dsp_frames],
-                                    &self.os_in_r[..clamped_dsp_frames],
-                                )
-                            } else {
-                                (
-                                    &self.in_l[..clamped_dsp_frames],
-                                    &self.in_r[..clamped_dsp_frames],
-                                )
-                            };
-                            #[cfg(not(feature = "feat_oversampling"))]
-                            let (left, right_feed) = (
-                                &self.in_l[..clamped_dsp_frames],
-                                &self.in_r[..clamped_dsp_frames],
-                            );
-                            let right: &[f32] = if num_pairs >= 2 { right_feed } else { left };
-                            Self::write_block(
-                                bridge,
-                                collected,
-                                &OutgoingBlock {
-                                    kind: protocol::SLOT_AUDIO,
-                                    host_frames,
-                                    os_factor,
-                                    sample_rate,
-                                    left,
-                                    right,
-                                    transport,
-                                    batch: &batch,
-                                },
-                            )
-                        };
-                        if published {
-                            self.commit_params(&batch);
-                            let target = bridge.submit_seq.load(Ordering::Acquire);
-                            if extended {
-                                // Already playing the previous block. A finish
-                                // inside this budget catches up and may clear
-                                // miss/extended pipelining after two hits.
-                                if bridge.wait_done(target, budget) {
-                                    self.pull_output(bridge, frames);
-                                    self.note_pipeline_success();
-                                }
-                            } else if bridge.wait_done(target, budget) {
-                                self.pull_output(bridge, frames);
-                            } else {
-                                self.note_live_miss(frames_u32);
-                            }
-                        }
-                        }
+                            use_oversampling,
+                            num_pairs >= 2,
+                            transport,
+                            &batch,
+                        );
                     }
                 }
 
