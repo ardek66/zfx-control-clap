@@ -11,6 +11,8 @@ pub mod params;
 pub mod protocol;
 #[cfg(feature = "feat_oversampling")]
 pub mod resampler;
+#[cfg(target_os = "linux")]
+pub mod rt_sched;
 pub mod zrc;
 
 use clack_plugin::prelude::*;
@@ -906,6 +908,9 @@ pub struct ZfxAudioProcessor<'a> {
     /// Normalized values last sent to the worker. `f32::NAN` = never sent.
     /// Parallel to `shared.params`.
     pub last_sent_norm: Vec<f32>,
+    /// Last `(policy, prio)` mirrored onto the worker from this audio thread.
+    #[cfg(target_os = "linux")]
+    sched_mirror: Option<rt_sched::SchedMirror>,
 }
 
 impl ZfxAudioProcessor<'_> {
@@ -1486,6 +1491,8 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
             spill_hits: 0,
             bypass: BypassMode::resolve(&shared.params),
             last_sent_norm: vec![f32::NAN; shared.params.len()],
+            #[cfg(target_os = "linux")]
+            sched_mirror: None,
         })
     }
 
@@ -1500,6 +1507,10 @@ impl<'a> PluginAudioProcessor<'a, ZfxShared, ZfxMainThread<'a>> for ZfxAudioProc
         if bridge_ptr.is_null() {
             return Ok(ProcessStatus::Continue);
         }
+
+        // Mirror host audio-thread priority onto the worker (fork was SCHED_OTHER).
+        #[cfg(target_os = "linux")]
+        rt_sched::mirror_to_worker(self.shared.worker_pid, &mut self.sched_mirror);
 
         let mut transport = BlockTransport::default();
         if let Some(info) = process.transport {
