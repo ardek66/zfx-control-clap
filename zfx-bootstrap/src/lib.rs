@@ -1331,8 +1331,10 @@ impl ZfxAudioProcessor<'_> {
         } else if hit {
             self.pull_target(bridge, target, frames);
         } else {
-            // Curve says stop waiting: escalate to PDC while holding last outs.
+            // Curve says stop waiting: escalate to PDC. Prefer a finished
+            // depth-2 block if the worker already completed one; else hold-last.
             self.enter_pipeline();
+            let _ = self.pull_ready(bridge, frames);
         }
     }
 }
